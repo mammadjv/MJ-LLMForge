@@ -13,7 +13,7 @@ def weights_init(m):
         nn.init.zeros_(m.bias)
 
 
-def get_regularization_parameters(model):
+def get_regularization_parameters(model, num_layers):
     decay = []
     no_decay = []
     for name, param in model.named_parameters():

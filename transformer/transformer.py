@@ -1,8 +1,10 @@
-from multiheadattention import CMHAttention
+import torch.nn as nn
+
+from .multiheadattention import CMHAttention
 
 
 class MultiLayerTransformer(nn.Module):
-  def __init__(self, num_layers=10, embed_dim=512, num_heads=num_heads, dropout=0.2):
+  def __init__(self, num_layers=10, embed_dim=512, num_heads=16, dropout=0.2):
     super(MultiLayerTransformer, self).__init__()
 
     self.layers = nn.ModuleList()
