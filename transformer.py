@@ -1,4 +1,4 @@
-from multiheadattention import MHAttention
+from multiheadattention import CMHAttention
 
 
 class MultiLayerTransformer(nn.Module):
@@ -7,7 +7,7 @@ class MultiLayerTransformer(nn.Module):
 
     self.layers = nn.ModuleList()
     for _ in range(num_layers):
-      self.layers.append(MHAttention(embed_dim=embed_dim, dropout=dropout, num_heads=num_heads))
+      self.layers.append(CMHAttention(embed_dim=embed_dim, dropout=dropout, num_heads=num_heads))
 
   def forward(self, x):
     for layer in self.layers:

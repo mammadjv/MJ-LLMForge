@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 
 
-# Multi Head Attention
-class MHAttention(nn.Module):
+# Causal Multi Head Attention
+class CMHAttention(nn.Module):
     def __init__(self,
                  embed_dim=512,
                  seq_len=1024,
@@ -11,7 +11,7 @@ class MHAttention(nn.Module):
                  num_heads=16,
                  dropout=0.1,
                 ):
-      super(MHAttention, self).__init__()
+      super(CMHAttention, self).__init__()
 
       self.embed_dim = embed_dim
       self.seq_len = seq_len
