@@ -13,17 +13,32 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data import RandomSampler
-
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import gpt_dataset
 from gpt import GPT
 from transformer import utils
 
 
-def validate(val_dataloader, language_model, criterion, device):
+def setup():
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+
+    
+def cleanup():
+    dist.destroy_process_group()
+
+
+def validate(val_dataloader, language_model, criterion, device, global_rank):
     language_model.eval()
-    total_loss = 0
-    print('')
+
+    total_loss = torch.zeros(1, device=device, dtype=torch.float16)
+    count = torch.zeros(1, device=device, dtype=torch.float16)
+
+    if global_rank == 0:
+        print('')
+
     with torch.no_grad():
         for batch_idx, (inputs, labels) in enumerate(val_dataloader):
             inputs = inputs.to(device)
@@ -33,13 +48,27 @@ def validate(val_dataloader, language_model, criterion, device):
                 outputs = language_model(inputs)
                 loss = criterion(outputs.view(-1, gpt_train_dataset.vocab_len), labels.view(-1))
 
-            total_loss += loss.item()
-            print(f"\rPerforming validation: Iteration {batch_idx}, Loss {loss}", end="", flush=True)
+            total_loss += loss.detach().to(total_loss.dtype)
+            count += 1.0
 
-    return total_loss/len(val_dataloader)
+            if global_rank == 0:
+                print(f"\rPerforming validation: Iteration {batch_idx}, Loss {loss}", end="", flush=True)
+
+    # Global reduce (SUM)
+    dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+    avg = total_loss / (len(val_dataloader) * world_size)
+
+    return float(avg.item())
 
 
 if __name__ == "__main__":
+    setup()
+
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = dist.get_world_size()
+    global_rank = dist.get_rank()
+    device = torch.device(f'cuda:{local_rank}')
+
     seq_len = 2000
     max_warmup_steps = 500
     epochs = 20
@@ -53,26 +82,28 @@ if __name__ == "__main__":
 
     lr_reduction_epoch = 3
     use_checkpointing = True
+    use_flash=False
 
     phase = str(sys.argv[1])
 
-    gpt_train_dataset, gpt_val_dataset = gpt_dataset.create_dataset('../dataset/openwebtext', seq_len=seq_len)
+    gpt_train_dataset, gpt_val_dataset = gpt_dataset.create_dataset('../dataset/openwebtext',
+                                                                    seq_len=seq_len,
+                                                                    world_size=world_size,
+                                                                    rank=global_rank)
     
     train_dataloader = DataLoader(
         gpt_train_dataset,
         batch_size=batch_size,
-        num_workers=batch_size,  # <-- bypass workers entirely
-        shuffle=False,
-        generator=torch.Generator().manual_seed(42),
-        )
-    
+        num_workers=2,
+        pin_memory=True,
+    )
+
     val_dataloader = DataLoader(
         gpt_val_dataset,
         batch_size=batch_size,
-        num_workers=batch_size,  # <-- bypass workers entirely
-        shuffle=False,
-        generator=torch.Generator().manual_seed(42),
-        )
+        num_workers=2,
+        pin_memory=True,
+    )
 
     language_model = GPT(
         dictionary_length=gpt_train_dataset.vocab_len,
@@ -81,14 +112,10 @@ if __name__ == "__main__":
         embed_dim=embed_dim,
         num_heads=num_heads,
         use_checkpointing=use_checkpointing,
-    )
+        use_flash=use_flash,
+    ).to(device)
 
-    if torch.cuda.device_count() > 1:
-        language_model = nn.DataParallel(language_model)
-
-    else:
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        language_model.to(device)
+    language_model = DDP(language_model, device_ids=[local_rank])
 
     decay, no_decay = utils.get_regularization_parameters(language_model, num_layers)
 
@@ -100,12 +127,15 @@ if __name__ == "__main__":
     loss_fn = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler()
 
+    global_rank = dist.get_rank()
+
     if phase == 'train':
         language_model.apply(utils.weights_init)
         step = 0
         best_val_loss = float('inf')
         for e in range(1, epochs):
-            total_train_loss = 0
+            # gpt_train_sampler.set_epoch(e)
+            total_train_loss = torch.zeros(1, device=device, dtype=torch.float16)
 
             optimizer = utils.linear_lr_update(optimizer, e, base_lr, lr_reduction_epoch)
 
@@ -113,6 +143,10 @@ if __name__ == "__main__":
                 step += 1
                 inputs = inputs.to(device)
                 labels = labels.to(device)
+                if global_rank == 0:
+                    print(f"\rIteration: {batch_idx}", end="", flush=True)
+
+                # continue
         
                 optimizer.zero_grad()
         
@@ -124,26 +158,36 @@ if __name__ == "__main__":
                     outputs = language_model(inputs)
                     loss = loss_fn(outputs.view(-1, gpt_train_dataset.vocab_len), labels.view(-1))
         
-                total_train_loss += loss.item()
+                total_train_loss += loss.detach()
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)  # must unscale before clipping
+                torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
 
-                print(f"\rIteration: {batch_idx}, Loss {loss}", end="", flush=True)
+                if global_rank == 0:
+                    print(f"\rIteration: {batch_idx}, Loss {loss}", end="", flush=True)
 
-            val_loss = validate(val_dataloader=val_dataloader, language_model=language_model, criterion=loss_fn, device=device)
+            val_loss = validate(val_dataloader=val_dataloader, global_rank=global_rank, language_model=language_model, criterion=loss_fn, device=device)
 
-            print(f'\nEpoch {e}: avg train loss {total_train_loss/len(train_dataloader)}, avg val loss {val_loss}', flush=True)
+            dist.all_reduce(total_train_loss, op=dist.ReduceOp.SUM)
+            total_train_loss /= world_size
 
-            if val_loss < best_val_loss:
+            if global_rank == 0:
+                print(f'\nEpoch {e}: avg train loss {total_train_loss/len(train_dataloader)}, avg val loss {val_loss}', flush=True)
+
+            if val_loss < best_val_loss and global_rank == 0:
                 best_val_loss = val_loss
                 checkpoint = {
-                    'model_state_dict': language_model.state_dict(),
+                    'model_state_dict': language_model.module.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }
                 torch.save(checkpoint, f'./best_model.pt')
 
+            dist.barrier(device_ids=[local_rank])
             language_model.train()
+
+        cleanup()
 
     else:
         checkpoint = torch.load('./best_model.pt')

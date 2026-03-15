@@ -8,13 +8,14 @@ from transformer import transformer
 
 
 class GPT(nn.Module):
-    def __init__(self, dictionary_length, seq_len, num_layers=16, embed_dim=512, num_heads=16, use_checkpointing=False):
+    def __init__(self, dictionary_length, seq_len, num_layers=16, embed_dim=512, num_heads=16, use_checkpointing=False, use_flash=True):
         super(GPT, self).__init__()
         self.transformer = transformer.MultiLayerTransformer(seq_len=seq_len,
                                                              num_layers=num_layers,
                                                              embed_dim=embed_dim,
                                                              num_heads=num_heads,
                                                              use_checkpointing=use_checkpointing,
+                                                             use_flash=use_flash,
                                                             )
         self.embeddin_table = nn.Embedding(dictionary_length, embed_dim)
         self.pos_embed = nn.Embedding(seq_len, embed_dim)
