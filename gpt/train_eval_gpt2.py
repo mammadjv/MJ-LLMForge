@@ -20,7 +20,6 @@ from gpt import GPT
 from transformer import utils
 
 
-
 def validate(val_dataloader, language_model, criterion, device):
     language_model.eval()
     total_loss = 0
@@ -93,7 +92,6 @@ if __name__ == "__main__":
 
     decay, no_decay = utils.get_regularization_parameters(language_model, num_layers)
 
-    # optimizer = torch.optim.AdamW([ {"params": decay, "weight_decay": 0.1}, {"params": no_decay, "weight_decay": 0.0}], lr=base_lr)
     import bitsandbytes as bnb
     optimizer = bnb.optim.AdamW8bit([
         {'params': decay, 'weight_decay': 0.1},
