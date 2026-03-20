@@ -1,6 +1,7 @@
+import math
+
 import torch.nn as nn
 import torch
-
 
 def weights_init(m):
     if isinstance(m, (nn.Linear, nn.Embedding)):
@@ -37,6 +38,17 @@ def linear_lr_update(optimizer, e, base_lr, lr_reduction_epoch=3):
         param['lr'] = base_lr * (0.5 ** ((e - 1) // lr_reduction_epoch))
 
     return optimizer
+
+
+def cosine_lr_update(optimizer, step, base_lr, max_steps, max_warmup_steps, min_lr=6e-5):
+    t = step - max_warmup_steps
+    T = max_steps - max_warmup_steps
+    lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * t / T))
+    for param in optimizer.param_groups:
+        param['lr'] = lr
+
+    return optimizer
+
 
 def optimizer_warmup(optimizer, base_lr, step, max_warmup_steps=5000):
     for param in optimizer.param_groups:
