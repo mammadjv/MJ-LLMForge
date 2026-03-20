@@ -2,6 +2,7 @@ import os
 import argparse
 import json
 import sys
+import time
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.data import RandomSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+import bitsandbytes as bnb
 
 import gpt_dataset
 from gpt import GPT
@@ -30,33 +32,41 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def validate(val_dataloader, language_model, criterion, device, global_rank):
+def validate(val_dataloader, language_model, device, global_rank, vocab_len, world_size):
     language_model.eval()
 
     total_loss = torch.zeros(1, device=device, dtype=torch.float16)
     count = torch.zeros(1, device=device, dtype=torch.float16)
+    loss_fn = nn.CrossEntropyLoss()
 
     if global_rank == 0:
         print('')
 
+    step = 0
+    stop_val_step = 50
     with torch.no_grad():
         for batch_idx, (inputs, labels) in enumerate(val_dataloader):
+            step += 1
             inputs = inputs.to(device)
             labels = labels.to(device)
 
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 outputs = language_model(inputs)
-                loss = criterion(outputs.view(-1, gpt_train_dataset.vocab_len), labels.view(-1))
+                loss = loss_fn(outputs.view(-1, vocab_len), labels.view(-1))
 
             total_loss += loss.detach().to(total_loss.dtype)
             count += 1.0
 
             if global_rank == 0:
-                print(f"\rPerforming validation: Iteration {batch_idx}, Loss {loss}", end="", flush=True)
+                print(f"\rPerforming validation. Iteration {step}: Loss {loss.item()}", end="", flush=True)
+
+            if step% stop_val_step == 0:
+                break                
 
     # Global reduce (SUM)
     dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-    avg = total_loss / (len(val_dataloader) * world_size)
+    dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    avg = total_loss / count
 
     return float(avg.item())
 
@@ -69,44 +79,52 @@ if __name__ == "__main__":
     global_rank = dist.get_rank()
     device = torch.device(f'cuda:{local_rank}')
 
-    seq_len = 2000
-    max_warmup_steps = 500
-    epochs = 20
-
-    batch_size = 4
-    base_lr = 1e-4
-
+    base_lr = 6e-4
+    seq_len = 2**10
     embed_dim = 1024
     num_heads=16
     num_layers = 24
 
-    lr_reduction_epoch = 3
-    use_checkpointing = True
-    use_flash=False
+    iter_batch_size = 4
+    actual_gpt_batch_size = 2**19 #0.5M
+    grad_accum_steps = int(actual_gpt_batch_size/(seq_len * iter_batch_size * world_size)) #(2**19)/((2**11)*4*gpu_cores)
+    max_warmup_steps = 100
+    val_step = 200
+    lr_reduction_step = 400
+
+    epochs = 20
+    use_checkpointing = False
+    use_flash=True
+    max_steps = 600000
 
     phase = str(sys.argv[1])
-
-    gpt_train_dataset, gpt_val_dataset = gpt_dataset.create_dataset('../dataset/openwebtext',
-                                                                    seq_len=seq_len,
-                                                                    world_size=world_size,
-                                                                    rank=global_rank)
     
+    data_dir = '../dataset/finewebedu'
+    gpt_train_dataset = gpt_dataset.GPTDataset(data_dir, 'train', iter_batch_size, seq_len, local_rank, world_size)
+    gpt_val_dataset = gpt_dataset.GPTDataset(data_dir, 'val', iter_batch_size, seq_len, local_rank, world_size)
+
+    vocab_len = gpt_train_dataset.vocab_len
+
     train_dataloader = DataLoader(
         gpt_train_dataset,
-        batch_size=batch_size,
-        num_workers=2,
+        batch_size=None,
+        num_workers=8,
         pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
     )
-
+    
     val_dataloader = DataLoader(
         gpt_val_dataset,
-        batch_size=batch_size,
-        num_workers=2,
+        batch_size=None,
+        num_workers=8,
         pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
     )
 
     language_model = GPT(
-        dictionary_length=gpt_train_dataset.vocab_len,
+        dictionary_length=vocab_len,
         seq_len=seq_len,
         num_layers=num_layers,
         embed_dim=embed_dim,
@@ -119,11 +137,16 @@ if __name__ == "__main__":
 
     decay, no_decay = utils.get_regularization_parameters(language_model, num_layers)
 
-    import bitsandbytes as bnb
     optimizer = bnb.optim.AdamW8bit([
         {'params': decay, 'weight_decay': 0.1},
         {'params': no_decay, 'weight_decay': 0.0},
     ], lr=base_lr)
+
+    # optimizer = torch.optim.AdamW([
+    #     {'params': decay, 'weight_decay': 0.1},
+    #     {'params': no_decay, 'weight_decay': 0.0},
+    # ], lr=base_lr)
+
     loss_fn = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler()
 
@@ -133,59 +156,92 @@ if __name__ == "__main__":
         language_model.apply(utils.weights_init)
         step = 0
         best_val_loss = float('inf')
-        for e in range(1, epochs):
-            # gpt_train_sampler.set_epoch(e)
-            total_train_loss = torch.zeros(1, device=device, dtype=torch.float16)
+        total_train_loss = torch.zeros(1, device=device, dtype=torch.float16)
+        loss_accum_steps = torch.zeros(1, device=device, dtype=torch.float32)
 
-            optimizer = utils.linear_lr_update(optimizer, e, base_lr, lr_reduction_epoch)
+        optimizer.zero_grad()
+        optimizer = utils.optimizer_warmup(optimizer, base_lr, 1, max_warmup_steps)
+        first_clock = time.time()
+        while True:
+            if step/grad_accum_steps > max_steps:
+                break
 
             for batch_idx, (inputs, labels) in enumerate(train_dataloader):
                 step += 1
-                inputs = inputs.to(device)
-                labels = labels.to(device)
-                if global_rank == 0:
-                    print(f"\rIteration: {batch_idx}", end="", flush=True)
+                
+                inputs = inputs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
-                # continue
-        
-                optimizer.zero_grad()
-        
-                # warm_up the optimizer if needed
-                if step <= max_warmup_steps:
-                    utils.optimizer_warmup(optimizer, base_lr, step,max_warmup_steps)
-
+                # for gradient_accumulation
                 with torch.amp.autocast("cuda", dtype=torch.float16):
                     outputs = language_model(inputs)
-                    loss = loss_fn(outputs.view(-1, gpt_train_dataset.vocab_len), labels.view(-1))
-        
-                total_train_loss += loss.detach()
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)  # must unscale before clipping
-                torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                    loss = loss_fn(outputs.view(-1, vocab_len), labels.view(-1))
 
-                if global_rank == 0:
-                    print(f"\rIteration: {batch_idx}, Loss {loss}", end="", flush=True)
+                loss_accum_steps += loss.detach()/grad_accum_steps
 
-            val_loss = validate(val_dataloader=val_dataloader, global_rank=global_rank, language_model=language_model, criterion=loss_fn, device=device)
+                scaled_loss = loss / grad_accum_steps
 
-            dist.all_reduce(total_train_loss, op=dist.ReduceOp.SUM)
-            total_train_loss /= world_size
+                if step % grad_accum_steps != 0:
+                    with language_model.no_sync():
+                        scaler.scale(scaled_loss).backward()
 
-            if global_rank == 0:
-                print(f'\nEpoch {e}: avg train loss {total_train_loss/len(train_dataloader)}, avg val loss {val_loss}', flush=True)
+                # every replica accumulated steps
+                else:
+                    scaler.scale(scaled_loss).backward()
+                    scaler.unscale_(optimizer)  # must unscale before clipping
+                    torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
 
-            if val_loss < best_val_loss and global_rank == 0:
-                best_val_loss = val_loss
-                checkpoint = {
-                    'model_state_dict': language_model.module.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }
-                torch.save(checkpoint, f'./best_model.pt')
+                    total_train_loss += loss_accum_steps
 
-            dist.barrier(device_ids=[local_rank])
-            language_model.train()
+                    update_step = step // grad_accum_steps
+                    if global_rank == 0:
+                        elapsed_time = time.time() - first_clock
+                        tokens_per_sec = (grad_accum_steps * iter_batch_size * seq_len * world_size) / elapsed_time
+                        elapsed_time = '{:.3f}'.format(time.time() - first_clock)
+                        print(f"\rStep {update_step}: Loss {loss_accum_steps.item()}, batch time {tokens_per_sec}, grad accum steps {grad_accum_steps}", end="", flush=True)
+                        first_clock = time.time()
+
+                    loss_accum_steps.zero_()
+                    optimizer.zero_grad()
+
+                    if update_step <= max_warmup_steps:
+                        optimizer = utils.optimizer_warmup(optimizer, base_lr, update_step, max_warmup_steps)
+
+                    else:
+                        optimizer = utils.cosine_lr_update(optimizer, update_step, base_lr, max_steps, max_warmup_steps, min_lr=6e-5)
+
+                    if update_step % val_step == 0:
+                        val_loss = validate(
+                            val_dataloader=val_dataloader,
+                            language_model=language_model,
+                            device=device,
+                            global_rank=global_rank,
+                            vocab_len=vocab_len,
+                            world_size=world_size,
+                        )
+    
+                        dist.all_reduce(total_train_loss, op=dist.ReduceOp.SUM)
+                        total_train_loss /= (world_size*val_step)
+    
+                        if global_rank == 0:
+                            print(f'\n Step {update_step}: avg train loss {total_train_loss.item()}, avg val loss {val_loss}', flush=True)
+    
+                        if val_loss < best_val_loss and global_rank == 0:
+                            best_val_loss = val_loss
+                            checkpoint = {
+                                'model_state_dict': language_model.module.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'step': step,
+                                'best_val_loss': best_val_loss,
+                            }
+                            torch.save(checkpoint, f'./best_model.pt')
+    
+                        total_train_loss.zero_()
+                        dist.barrier(device_ids=[local_rank])
+                        language_model.train()
+
 
         cleanup()
 
