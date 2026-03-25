@@ -17,11 +17,25 @@ from torch.utils.data import RandomSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import bitsandbytes as bnb
+import tiktoken
+from collections import OrderedDict
 
 import gpt_dataset
 from gpt import GPT
 from transformer import utils
 
+
+
+def load_state_dict_strip_module(path, map_location="cpu"):
+    """Loads a state_dict and strips a leading 'module.' if present."""
+    state_dict = torch.load(path, map_location=map_location)
+    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
+
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        new_state_dict[k.replace("module.", "")] = v
+    return new_state_dict
 
 def setup():
     dist.init_process_group(backend='nccl')
@@ -131,28 +145,22 @@ if __name__ == "__main__":
         num_heads=num_heads,
         use_checkpointing=use_checkpointing,
         use_flash=use_flash,
-    ).to(device)
-
-    language_model = DDP(language_model, device_ids=[local_rank])
-
-    decay, no_decay = utils.get_regularization_parameters(language_model, num_layers)
-
-    optimizer = bnb.optim.AdamW8bit([
-        {'params': decay, 'weight_decay': 0.1},
-        {'params': no_decay, 'weight_decay': 0.0},
-    ], lr=base_lr)
-
-    # optimizer = torch.optim.AdamW([
-    #     {'params': decay, 'weight_decay': 0.1},
-    #     {'params': no_decay, 'weight_decay': 0.0},
-    # ], lr=base_lr)
-
-    loss_fn = nn.CrossEntropyLoss()
-    scaler = torch.amp.GradScaler()
+    )
 
     global_rank = dist.get_rank()
 
     if phase == 'train':
+        language_model = DDP(language_model, device_ids=[local_rank])
+
+        decay, no_decay = utils.get_regularization_parameters(language_model, num_layers)
+    
+        optimizer = bnb.optim.AdamW8bit([
+            {'params': decay, 'weight_decay': 0.1},
+            {'params': no_decay, 'weight_decay': 0.0},
+        ], lr=base_lr)
+    
+        loss_fn = nn.CrossEntropyLoss()
+        scaler = torch.amp.GradScaler()
         language_model.apply(utils.weights_init)
         step = 0
         best_val_loss = float('inf')
@@ -246,18 +254,21 @@ if __name__ == "__main__":
         cleanup()
 
     else:
-        checkpoint = torch.load('./best_model.pt')
-        language_model.load_state_dict(checkpoint['model_state_dict'])
-        language_model.eval()
+        ckpt_path = './best_model.pt'
+        language_model.load_state_dict(load_state_dict_strip_module(ckpt_path, map_location="cpu"), strict=True)
+        language_model = language_model.to(device)  # separate line, on the model
+        language_model = DDP(language_model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
+
+        encoding = tiktoken.get_encoding("gpt2")
+        text = "Alex went to vernal falls"
 
         for temperature in [0.6, 0.7, 0.8, 0.9]:
             for k in [10, 20, 30]:
+                result = encoding.encode(text)
                 print(f'####################\nGenerating with temperature {temperature}, and k {k}\n-------------------')
-                start_char = np.random.randint(11, len(chars)-1)
-                result = [start_char]
 
                 # set your desired text length
-                for i in range(1000):
+                for i in range(40):
                     if len(result) > seq_len:
                       result_tensor = torch.tensor([result[-seq_len:]]).to(device)
 
@@ -269,4 +280,4 @@ if __name__ == "__main__":
                     result.append(next_token.item())
     
                 # or save it wherever you want
-                print(f'{train_dataset.decode(result)}\n<End of poem with 1000 characters>', flush=True)
+                print(f'{encoding.decode(result)}\n<End of poem with 1000 characters>', flush=True)
