@@ -19,37 +19,48 @@ class QADataset(IterableDataset):
         self.world_size = world_size
         self.vocab_len = 50304
         self.word_encoding = tiktoken.get_encoding("gpt2")
-        self.ctx_separator = self.word_encoding.encode('Context:')
+
+        # 1. Handle the special token correctly
+        # self.eot_id = self.word_encoding.encode('<|endoftext|>', allowed_special={'<|endoftext|>'})[0]
+        
+        # 2. Standard tokens don't need the special flag
+        self.ans_tokens = torch.tensor(self.word_encoding.encode('Answer:'))
+        self.ctx_tokens = torch.tensor(self.word_encoding.encode('Context:'))
+
+        print(self.ans_tokens, self.ctx_tokens)
+        # asd
 
     def get_valid_tokens_mask(self, x, B, T):
-        matches = (x[:, :-1] == self.ctx_separator[0]) & (x[:, 1:] == self.ctx_separator[1])
-        exists = matches.any(dim=1)
+        # 1. Markers
+        ans_seq = self.ans_tokens.to(x.device)
+        ctx_seq = self.ctx_tokens.to(x.device)
+        ans_win, ctx_win = len(ans_seq), len(ctx_seq)
+        # 2. Find markers
+        ans_match = (x.unfold(1, ans_win, 1) == ans_seq).all(dim=2)
+        ctx_match = (x.unfold(1, ctx_win, 1) == ctx_seq).all(dim=2)
+        ans_starts = torch.zeros((B, T), device=x.device, dtype=torch.int)
+        ans_starts[:, :ans_match.size(1)] = ans_match.int()
+        ctx_starts = torch.zeros((B, T), device=x.device, dtype=torch.int)
+        ctx_starts[:, :ctx_match.size(1)] = ctx_match.int()
+        # 3. Gate Logic
+        gate_open = torch.cumsum(ans_starts, dim=1)
+        # Shift ctx_starts left by 2 so the gate closes 2 tokens before "Context:"
+        ctx_starts_shifted = torch.roll(ctx_starts, shifts=-3, dims=1)
+        ctx_starts_shifted[:, -3:] = 0
+        gate_close = torch.cumsum(ctx_starts_shifted, dim=1)
+        mask_bool = (gate_open > 0) & (gate_open > gate_close) & (ctx_starts_shifted == 0)
+        # 4. Offset Fix: Turn off the "Answer:" prompt tokens
+        for offset in range(ans_win):
+            marker_part = torch.roll(ans_starts, shifts=offset, dims=1)
+            marker_part[:, :offset] = 0
+            mask_bool &= ~marker_part.bool()
 
-        first_indices = torch.where(
-            exists,
-            matches.to(torch.uint8).argmax(dim=1),
-            torch.tensor(-1, device=x.device)
-        )
-
-        flipped_matches = torch.flip(matches, dims=[1])
-        last_indices_flipped = flipped_matches.to(torch.uint8).argmax(dim=1)
-
-        last_indices = torch.where(
-            exists,
-            (matches.size(1) - 1) - last_indices_flipped,
-            torch.tensor(-1, device=x.device)
-        )
-
-        arange = torch.arange(T, device=x.device).unsqueeze(0)
-        after_first = arange >= first_indices.unsqueeze(1)
-        before_last_start = arange < last_indices.unsqueeze(1)
-        mask_bool = after_first & before_last_start & exists.unsqueeze(1)
-        final_mask = torch.where(mask_bool, 1, -1)
-        return final_mask
+        return torch.where(mask_bool, 1, -1)
 
 
     def get_block_causal_mask(self, x, B, T):
-        matches = (x[:, :-1] == self.ctx_separator[0]) & (x[:, 1:] == self.ctx_separator[1])
+        ctx_seq = self.ctx_tokens.to(x.device)
+        matches = (x[:, :-1] == ctx_seq[0]) & (x[:, 1:] == ctx_seq[1])
         coords = torch.nonzero(matches)
 
         # 1. Initialize a Block ID map for each position in the batch
@@ -106,10 +117,15 @@ class QADataset(IterableDataset):
                 y = buf[1:].view(B, T)
 
                 causal_mask = self.get_block_causal_mask(x, B, T)
-                mask_x = self.get_valid_tokens_mask(x, B, T)
-                mask_y = F.pad(mask_x[:, :-1], (1, 0), value=-1)
 
-                yield x, y, mask_x, mask_y, causal_mask
+                mask_y = self.get_valid_tokens_mask(x, B, T)
+                mask_y = F.pad(mask_y[:, :-1], (1, 0), value=-1)
+                
+                if (mask_y == 1).sum() == 0:
+                    pos += step
+                    continue
+
+                yield x, y, mask_y, causal_mask
                 pos += step
 
             shard_idx = (shard_idx + num_workers) % len(self.shards)
