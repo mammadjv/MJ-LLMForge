@@ -41,7 +41,7 @@ class CMHAttention(nn.Module):
         self.project = nn.Linear(self.embed_dim, self.embed_dim)
 
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         B, N, C = x.shape
         
         C_heads = C//self.num_heads
@@ -53,15 +53,18 @@ class CMHAttention(nn.Module):
         q = self.q(x_norm).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
         v = self.v(x_norm).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
 
+        if attention_mask is not None:
+            self.attention_mask = attention_mask
+
         if self.use_flash:
-            combined_tokens = F.scaled_dot_product_attention(q, k, v, attn_mask=self.attention_mask[:, :, :N, :N])
+            combined_tokens = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
 
         else:
             # # compute attention matrix
             attention_matrix = (q @ k.transpose(-1, -2))/(C_heads**0.5)   # (B, num_heads, N, N)
 
             # # scale the sum of attention weights for a token to 1
-            attention_matrix = attention_matrix.masked_fill(~self.attention_mask[:, :, :N, :N], float("-inf"))
+            attention_matrix = attention_matrix.masked_fill(~attention_mask, float("-inf"))
             attention_matrix = torch.softmax(attention_matrix, dim=-1) # (B, num_heads, N, N)
 
             # create the weigted some of token representations

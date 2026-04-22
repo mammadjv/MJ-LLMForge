@@ -12,14 +12,14 @@ class MultiLayerTransformer(nn.Module):
         self.use_checkpointing = use_checkpointing
         for _ in range(num_layers):
             self.layers.append(CMHAttention(embed_dim=embed_dim, dropout=dropout, num_heads=num_heads, seq_len=seq_len, use_flash=use_flash))
-            
-    def forward(self, x):
+
+    def forward(self, x, attention_mask=None):
         for layer in self.layers:
             if self.use_checkpointing:
-                x = checkpoint(layer, x, use_reentrant=False, preserve_rng_state=True)
+                x = checkpoint(layer, x, attention_mask, use_reentrant=False, preserve_rng_state=True)
 
             else:
-                x = layer(x)
+                x = layer(x, attention_mask)
 
         return x
 
