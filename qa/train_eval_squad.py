@@ -197,17 +197,6 @@ if __name__ == "__main__":
 
                 causal_mask = causal_mask.to(device, non_blocking=True).unsqueeze(1)
 
-                # if step == 1:
-                #     row_idx = 0
-
-                # for i in range(1024):
-                #     tok = inputs[row_idx, i].item()
-                #     label = labels[row_idx, i].item()
-                #     m = mask_y[row_idx, i].item()
-
-                #     if m == 1:
-                #         print(f"Token {i}: {qa_train_dataset.word_encoding.decode([tok])}  {qa_train_dataset.word_encoding.decode([label])} [ACTIVE LOSS]")
-
                 # asd
 
                 # for gradient_accumulation
