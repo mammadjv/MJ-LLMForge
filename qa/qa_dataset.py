@@ -20,15 +20,9 @@ class QADataset(IterableDataset):
         self.vocab_len = 50304
         self.word_encoding = tiktoken.get_encoding("gpt2")
 
-        # 1. Handle the special token correctly
-        # self.eot_id = self.word_encoding.encode('<|endoftext|>', allowed_special={'<|endoftext|>'})[0]
-        
         # 2. Standard tokens don't need the special flag
         self.ans_tokens = torch.tensor(self.word_encoding.encode('Answer:'))
         self.ctx_tokens = torch.tensor(self.word_encoding.encode('Context:'))
-
-        print(self.ans_tokens, self.ctx_tokens)
-        # asd
 
     def get_valid_tokens_mask(self, x, B, T):
         # 1. Markers

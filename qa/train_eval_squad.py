@@ -197,8 +197,6 @@ if __name__ == "__main__":
 
                 causal_mask = causal_mask.to(device, non_blocking=True).unsqueeze(1)
 
-                # asd
-
                 # for gradient_accumulation
                 with torch.amp.autocast("cuda", dtype=torch.float16):
                     outputs = language_model(inputs, causal_mask)
