@@ -14,19 +14,19 @@ class CMHAttention(nn.Module):
                  use_flash=True,
                 ):
         super(CMHAttention, self).__init__()
-        
+
         self.embed_dim = embed_dim
         self.seq_len = seq_len
         self.num_heads = num_heads
         self.mlp_ratio = int(mlp_ratio)
-        
+
         self.k = nn.Linear(self.embed_dim, self.embed_dim)
         self.q = nn.Linear(self.embed_dim, self.embed_dim)
         self.v = nn.Linear(self.embed_dim, self.embed_dim)
-        
+
         attention_mask = torch.tril(torch.ones(1, self.num_heads, seq_len, seq_len, dtype=torch.bool))
         self.register_buffer("attention_mask", attention_mask)
-        
+
         self.ln1 = nn.LayerNorm(self.embed_dim)
         self.ln2 = nn.LayerNorm(self.embed_dim)
         self.use_flash = use_flash
@@ -53,8 +53,10 @@ class CMHAttention(nn.Module):
         q = self.q(x_norm).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
         v = self.v(x_norm).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
 
-        if attention_mask is not None:
-            self.attention_mask = attention_mask
+        active_mask = attention_mask if attention_mask is not None else self.attention_mask
+
+        if active_mask.size(-1) > N:
+            active_mask = active_mask[..., :N, :N]
 
         if self.use_flash:
             combined_tokens = F.scaled_dot_product_attention(q, k, v,
@@ -64,14 +66,10 @@ class CMHAttention(nn.Module):
                                                             )
 
         else:
-            # # compute attention matrix
-            attention_matrix = (q @ k.transpose(-1, -2))/(C_heads**0.5)   # (B, num_heads, N, N)
+            attention_matrix = (q @ k.transpose(-1, -2)) / (C_heads ** 0.5)   # (B, num_heads, N, N)
+            attention_matrix = attention_matrix.masked_fill(~active_mask, float("-inf"))
 
-            # # scale the sum of attention weights for a token to 1
-            attention_matrix = attention_matrix.masked_fill(~attention_mask, float("-inf"))
             attention_matrix = torch.softmax(attention_matrix, dim=-1) # (B, num_heads, N, N)
-
-            # create the weigted some of token representations
             combined_tokens = attention_matrix @ v # (B, num_heads, N, C_heads)
 
         # reshape back to original representations

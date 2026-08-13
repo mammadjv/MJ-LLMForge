@@ -24,9 +24,9 @@ class GPT(nn.Module):
         self.classifier = nn.Linear(embed_dim, dictionary_length, bias=True)
         self.classifier.weight = self.embeddin_table.weight
 
-    def forward(self, x):
+    def forward(self, x, causal_mask):
         embedded_chars = self.embeddin_table(x) + self.pos_embed(torch.arange(x.shape[1], device=x.device))
         embedded_chars = self.dropout(embedded_chars)
-        output = self.transformer(embedded_chars)
+        output = self.transformer(embedded_chars, causal_mask)
         output = self.ln_f(output)
         return self.classifier(output)
