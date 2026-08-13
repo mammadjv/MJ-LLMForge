@@ -21,6 +21,7 @@ class CMHAttention(nn.Module):
         self.seq_len = seq_len
         self.num_heads = num_heads
         self.mlp_ratio = int(mlp_ratio)
+
         self.lora_rank = lora_rank
 
         self.k = nn.Linear(self.embed_dim, self.embed_dim)

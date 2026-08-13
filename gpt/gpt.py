@@ -36,6 +36,7 @@ class GPT(nn.Module):
         self.classifier = nn.Linear(embed_dim, dictionary_length, bias=True)
         self.classifier.weight = self.embeddin_table.weight
 
+
     def forward(self, x, causal_mask=None):
         embedded_chars = self.embeddin_table(x) + self.pos_embed(torch.arange(x.shape[1], device=x.device))
         embedded_chars = self.dropout(embedded_chars)
