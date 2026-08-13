@@ -24,7 +24,8 @@ import tiktoken
 import matplotlib.pyplot as plt
 
 import qa_dataset
-from gpt import GPT
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from gpt.gpt import GPT
 from transformer import utils
 
 
