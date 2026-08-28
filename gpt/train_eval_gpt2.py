@@ -125,7 +125,6 @@ def run_train(config, device, local_rank, global_rank, world_size):
     llm_trainer.update_dataloaders(train_dataloader,
                             val_dataloader,
                            )
-    
     llm_trainer.start()
 
 
