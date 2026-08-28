@@ -5,13 +5,29 @@ from .multiheadattention import CMHAttention
 
 
 class MultiLayerTransformer(nn.Module):
-    def __init__(self, seq_len, num_layers=10, embed_dim=512, num_heads=16, dropout=0.2, use_checkpointing=False, use_flash=True):
+    def __init__(self,
+                 seq_len,
+                 num_layers=10,
+                 embed_dim=512,
+                 num_heads=16,
+                 dropout=0.2,
+                 use_checkpointing=False,
+                 use_flash=True,
+                 lora_rank=0,
+                ):
         super(MultiLayerTransformer, self).__init__()
         
         self.layers = nn.ModuleList()
         self.use_checkpointing = use_checkpointing
         for _ in range(num_layers):
-            self.layers.append(CMHAttention(embed_dim=embed_dim, dropout=dropout, num_heads=num_heads, seq_len=seq_len, use_flash=use_flash))
+            self.layers.append(CMHAttention(
+                embed_dim=embed_dim,
+                dropout=dropout,
+                num_heads=num_heads,
+                seq_len=seq_len,
+                use_flash=use_flash,
+                lora_rank=lora_rank,
+            ))
 
     def forward(self, x, attention_mask=None):
         for layer in self.layers:
@@ -23,4 +39,6 @@ class MultiLayerTransformer(nn.Module):
 
         return x
 
-    
+    def apply_lora(self):
+        for layer in self.layers:
+            layer.apply_lora()

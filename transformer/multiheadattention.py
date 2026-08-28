@@ -12,6 +12,8 @@ class CMHAttention(nn.Module):
                  num_heads=16,
                  dropout=0.1,
                  use_flash=True,
+                 lora_rank=0,
+                 lora_alpha=16,
                 ):
         super(CMHAttention, self).__init__()
 
@@ -19,13 +21,25 @@ class CMHAttention(nn.Module):
         self.seq_len = seq_len
         self.num_heads = num_heads
         self.mlp_ratio = int(mlp_ratio)
+        self.lora_rank = lora_rank
 
         self.k = nn.Linear(self.embed_dim, self.embed_dim)
         self.q = nn.Linear(self.embed_dim, self.embed_dim)
         self.v = nn.Linear(self.embed_dim, self.embed_dim)
 
-        attention_mask = torch.tril(torch.ones(1, self.num_heads, seq_len, seq_len, dtype=torch.bool))
-        self.register_buffer("attention_mask", attention_mask)
+        attention_mask = torch.tril(torch.ones(1, self.num_heads, self.seq_len, self.seq_len, dtype=torch.bool))
+        self.register_buffer("attention_mask", attention_mask, persistent=False)
+
+        if self.lora_rank > 0:
+            self.lora_scale = 2
+            self.Bk = nn.Parameter(torch.zeros(self.embed_dim, self.lora_rank))
+            self.Ak = nn.Parameter(torch.randn(self.lora_rank, self.embed_dim)*0.1)
+
+            self.Bq = nn.Parameter(torch.zeros(self.embed_dim, self.lora_rank))
+            self.Aq = nn.Parameter(torch.randn(self.lora_rank, self.embed_dim)*0.1)
+
+            self.Bv = nn.Parameter(torch.zeros(self.embed_dim, self.lora_rank))
+            self.Av = nn.Parameter(torch.randn(self.lora_rank, self.embed_dim)*0.1)
 
         self.ln1 = nn.LayerNorm(self.embed_dim)
         self.ln2 = nn.LayerNorm(self.embed_dim)
@@ -39,7 +53,14 @@ class CMHAttention(nn.Module):
         )
 
         self.project = nn.Linear(self.embed_dim, self.embed_dim)
+        self.lora_merged = False
 
+    def apply_lora(self):
+        with torch.no_grad():
+            self.q.weight += self.lora_scale * (self.Bq @ self.Aq)
+            self.k.weight += self.lora_scale * (self.Bk @ self.Ak)
+            self.v.weight += self.lora_scale * (self.Bv @ self.Av)
+            self.lora_merged = True
 
     def forward(self, x, attention_mask=None):
         B, N, C = x.shape
@@ -52,6 +73,26 @@ class CMHAttention(nn.Module):
         k = self.k(x_norm).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
         q = self.q(x_norm).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
         v = self.v(x_norm).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
+
+        if self.lora_rank > 0 and not self.lora_merged:
+            k_lora = F.linear(
+                F.linear(x_norm, self.Ak),
+                self.Bk,
+            ).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
+
+            q_lora = F.linear(
+                F.linear(x_norm, self.Aq),
+                self.Bq,
+            ).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
+
+            v_lora = F.linear(
+                F.linear(x_norm, self.Av),
+                self.Bv,
+            ).reshape(B, N, self.num_heads, C_heads).transpose(-2, -3) # (B, num_heads, N, C_heads)
+
+            q = q + self.lora_scale * q_lora
+            k = k + self.lora_scale * k_lora
+            v = v + self.lora_scale * v_lora
 
         active_mask = attention_mask if attention_mask is not None else self.attention_mask
 
