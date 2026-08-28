@@ -92,6 +92,8 @@ def setup():
     dist.init_process_group(backend='nccl')
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
 
+def cleanup():
+    dist.destroy_process_group()
 
 def validate(val_dataloader, language_model, device, global_rank, vocab_len, world_size):
     language_model.eval()
@@ -169,6 +171,7 @@ def run_train(config, device, local_rank, global_rank, world_size):
     num_workers = config['num_workers']
     data_dir = config['data_dir']
     gpt_path = config['gpt_path']
+    lora_rank = config['lora_rank']
 
     language_model = GPT(
         dictionary_length=vocab_len,
@@ -178,6 +181,7 @@ def run_train(config, device, local_rank, global_rank, world_size):
         num_heads=num_heads,
         use_checkpointing=use_checkpointing,
         use_flash=use_flash,
+        lora_rank=lora_rank,
     )
 
     grad_accum_steps = int(actual_gpt_batch_size/(seq_len * iter_batch_size * world_size)) #(2**12)/((2**10)*1*gpu_cores)
@@ -202,11 +206,26 @@ def run_train(config, device, local_rank, global_rank, world_size):
         persistent_workers=True
     )
 
-    language_model.load_state_dict(load_state_dict_strip_module_gpt(gpt_path, map_location="cpu"), strict=True)
-
-    for layer in language_model.transformer.layers[:n_frozen_layers]:
-        for param in layer.parameters():
+    gpt_state = load_state_dict_strip_module_gpt(gpt_path,
+                                         map_location="cpu",
+                                        )
+    language_model.load_state_dict(
+        gpt_state,
+        strict=False,
+    )
+    
+    if lora_rank > 0:   # LORA Finetuning
+        for param in language_model.parameters():
             param.requires_grad = False
+
+        for name, param in language_model.named_parameters():
+            if any(x in name for x in ["Aq", "Bq", "Ak", "Bk", "Av", "Bv"]):
+                param.requires_grad = True
+
+    else:   # Traditional Finetuning
+        for layer in language_model.transformer.layers[:n_frozen_layers]:
+            for param in layer.parameters():
+                param.requires_grad = False
 
     language_model = language_model.to(device)
     language_model = DDP(
@@ -216,6 +235,7 @@ def run_train(config, device, local_rank, global_rank, world_size):
     )
 
     decay, no_decay = utils.get_regularization_parameters(language_model, num_layers)
+
 
     decay = [p for p in decay if p.requires_grad]
     no_decay = [p for p in no_decay if p.requires_grad]
@@ -237,8 +257,9 @@ def run_train(config, device, local_rank, global_rank, world_size):
     optimizer.zero_grad()
     optimizer = utils.optimizer_warmup(optimizer, base_lr, 1, max_warmup_steps)
     first_clock = time.time()
+
     while True:
-        if step/grad_accum_steps > max_steps:
+        if step // grad_accum_steps > max_steps:
             break
 
         for batch_idx, (inputs, labels, mask_y, causal_mask) in enumerate(train_dataloader):
@@ -314,69 +335,121 @@ def run_train(config, device, local_rank, global_rank, world_size):
             
                     if val_loss < best_val_loss and global_rank == 0:
                         best_val_loss = val_loss
-                        checkpoint = {
-                            'model_state_dict': language_model.module.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'step': step,
-                            'best_val_loss': best_val_loss,
-                        }
-                        torch.save(checkpoint, './best_model_qa_all_{}.pt'.format(n_frozen_layers))
+                        if lora_rank == 0:
+                            checkpoint = {
+                                'model_state_dict': language_model.module.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'step': step,
+                                'best_val_loss': best_val_loss,
+                            }
+                            torch.save(checkpoint, './best_model_qa_all_lora_{}.pt'.format(n_frozen_layers))
+
+                        else:
+                            lora_state_dict = {
+                                name: param.detach().cpu()
+                                for name, param in language_model.module.named_parameters()
+                                if any(key in name for key in ["Aq", "Bq", "Ak", "Bk", "Av", "Bv"])
+                            }
+
+                            checkpoint = {
+                                'model_state_dict': lora_state_dict,
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                'step': step,
+                                'best_val_loss': best_val_loss,
+                                }
+
+                            torch.save(checkpoint, "lora_weights_{}.pt".format(lora_rank))
 
                     total_train_loss.zero_()
                     dist.barrier(device_ids=[local_rank])
                     language_model.train()
+                    if update_step > max_steps:
+                        break
 
 
 def run_test(config, device, local_rank):
-    base_lr = config['base_lr']
     seq_len = config['seq_len']
     embed_dim = config['embed_dim']
     num_heads = config['num_heads']
     num_layers = config['num_layers']
-    n_frozen_layers = config['n_frozen_layers']
-
-    iter_batch_size = config['iter_batch_size']
-    actual_gpt_batch_size = config['actual_gpt_batch_size']
-
-    epochs = config['epochs']
     use_checkpointing = config['use_checkpointing']
     use_flash = config['use_flash']
-    max_steps = config['max_steps']
-    max_warmup_steps = config['max_warmup_steps']
-    val_step = config['val_step']
-    lr_reduction_step = config['lr_reduction_step']
-    num_workers = config['num_workers']
     data_dir = config['data_dir']
     gpt_path = config['gpt_path']
 
-    language_model = GPT(
-        dictionary_length=vocab_len,
-        seq_len=seq_len,
-        num_layers=num_layers,
-        embed_dim=embed_dim,
-        num_heads=num_heads,
-        use_checkpointing=use_checkpointing,
-        use_flash=use_flash,
-    )
-
-    language_model = language_model.to(device)  # separate line, on the model
-    language_model = DDP(language_model,
-                         device_ids=[local_rank],
-                         output_device=local_rank,
-                         broadcast_buffers=False,
-                        )
+    # checkpoints = [
+        # ('./best_model_qa_all_4.pt', 0),
+        # ('./best_model_qa_all_0.pt', 0),
+        # ('./lora_state_16.pt', 16),
+        # ('./lora_state_8.pt', 8),
+    # ]
 
     checkpoints = [
-        './best_model_qa_all_0.pt',
-        './best_model_qa_all_4.pt',
+        ('./lora_weights_32.pt', 32),
+        ('./lora_weights_8.pt', 8),
+        ('./lora_weights_16.pt', 16),
+        ('./best_model_qa_all_lora_8.pt', 0),
+        ('./best_model_qa_all_lora_16.pt', 0),
     ]
-    for ckpt_path in checkpoints:
+
+    for ckpt_path, lora_rank in checkpoints:
         print("\n" + "=" * 60)
         print("Testing checkpoint:", ckpt_path)
         print("=" * 60)
-        language_model.module.load_state_dict(load_state_dict_strip_module_qa(ckpt_path, map_location="cpu"), strict=False)
+
+        language_model = GPT(
+            dictionary_length=vocab_len,
+            seq_len=seq_len,
+            num_layers=num_layers,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            use_checkpointing=use_checkpointing,
+            use_flash=use_flash,
+            lora_rank=lora_rank,
+        )
+
+        # Traditional Finetuning
+        if lora_rank == 0:
+            language_model.load_state_dict(
+                load_state_dict_strip_module_qa(ckpt_path, map_location="cpu"),
+                strict=False,
+            )
+
+        else:
+            language_model.load_state_dict(
+                load_state_dict_strip_module_qa(gpt_path,
+                                                 map_location="cpu",
+                                                ),
+                strict=False,
+            )
+
+            # Load adapter
+            lora_checkpoint = torch.load(ckpt_path, map_location="cpu")
+            language_model.load_state_dict(
+                lora_checkpoint["model_state_dict"],
+                strict=False,
+            )
+            language_model.apply_lora()
+
+        language_model = language_model.to(device)
+        language_model = DDP(
+            language_model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+        )
+
         language_model.eval()
-        test_dataset = qa_dataset.QADataset(data_dir=data_dir, split='test', batch_size=1, seq_len=seq_len, rank=0, world_size=1)
+
+        test_dataset = qa_dataset.QADataset(
+            data_dir=data_dir,
+            split='test',
+            batch_size=1,
+            seq_len=seq_len,
+            rank=0,
+            world_size=1
+        )
+
         test_loader = DataLoader(test_dataset, batch_size=1)
         eot_token = test_dataset.word_encoding.eot_token
 
@@ -384,26 +457,25 @@ def run_test(config, device, local_rank):
             total_em = 0
             total_f1 = 0
             num_examples = 0
+
             for idx, (prompt, ground_truth) in enumerate(test_loader):
                 x = prompt.to(device=device, dtype=torch.long)
                 prompt_len = x.size(1)
 
-                for _ in range(150):
+                for j in range(150):
                     curr_T = x.size(1)
                     causal = torch.tril(torch.ones(curr_T, curr_T, device=device, dtype=torch.bool))
                     attn_mask = torch.where(causal, 0.0, float("-inf")).unsqueeze(0).unsqueeze(1)
+                    begin = time.time()
                     logits = language_model(x, attn_mask)
-
                     next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                     x = torch.cat([x, next_token], dim=1)
-
                     if next_token.item() == eot_token:
                         break
 
                 generated_ids = x[0, prompt_len:].cpu().tolist()
                 generated_text = test_dataset.word_encoding.decode(generated_ids)
 
-                # Ground-truth answer
                 ground_truth_ids = ground_truth[0].cpu().tolist()
                 ground_truth_text = test_dataset.word_encoding.decode(ground_truth_ids)
 
@@ -417,7 +489,7 @@ def run_test(config, device, local_rank):
                 total_f1 += f1
                 num_examples += 1
 
-                if idx % 1000 == 0:
+                if idx % 3000 == 0:
                     print(test_dataset.word_encoding.decode(x[0].cpu().tolist()))
                     print("Generated answer:{}".format(generated_text), flush=True)
                     print("Ground truth:{}".format(ground_truth_text), flush=True)
@@ -427,27 +499,42 @@ def run_test(config, device, local_rank):
             avg_em = 100 * total_em / num_examples
             avg_f1 = 100 * total_f1 / num_examples
 
-            print("\nCheckpoint:", ckpt_path)
-            print("EM: {:.2f}%".format(avg_em))
-            print("F1: {:.2f}%".format(avg_f1))
+            print("\nCheckpoint:", ckpt_path, flush=True)
+            print("EM: {:.2f}%".format(avg_em), flush=True)
+            print("F1: {:.2f}%".format(avg_f1), flush=True)
 
+        del language_model
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--phase", type=str, required=True)
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--lora_rank", type=int, default=None)
+    parser.add_argument("--n_frozen_layers", type=int, default=None)
+
+    args = parser.parse_args()
+
     setup()
 
-    phase = str(sys.argv[1])
-    config = str(sys.argv[2])
-
-    with open("config.json", "r") as f:
+    with open(args.config, "r") as f:
         config = json.load(f)
 
-    local_rank = int(os.environ['LOCAL_RANK'])
+    # Override config only if explicitly provided
+    if args.lora_rank is not None:
+        config["lora_rank"] = args.lora_rank
+
+    if args.n_frozen_layers is not None:
+        config["n_frozen_layers"] = args.n_frozen_layers
+
+    local_rank = int(os.environ["LOCAL_RANK"])
     world_size = dist.get_world_size()
     global_rank = dist.get_rank()
-    device = torch.device(f'cuda:{local_rank}')
+    device = torch.device(f"cuda:{local_rank}")
     vocab_len = qa_dataset.get_vocab_len()
 
-    if phase == 'train':
+    if args.phase == "train":
         run_train(config, device, local_rank, global_rank, world_size)
 
     else:

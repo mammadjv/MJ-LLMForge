@@ -9,12 +9,13 @@
   "epochs": 20,
   "use_checkpointing": false,
   "use_flash": true,
-  "max_steps": 600000,
+  "max_steps": 10000,
   "max_warmup_steps": 100,
   "val_step": 200,
   "lr_reduction_step": 400,
   "data_dir": "../dataset/squadv2",
   "num_workers": 8,
-  "n_frozen_layers": 4,
+  "n_frozen_layers": 16,
+  "lora_rank": 32,
   "gpt_path": "../gpt/best_model.pt"
 }
