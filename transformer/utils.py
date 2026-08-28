@@ -18,9 +18,6 @@ def get_regularization_parameters(model, num_layers):
     decay = []
     no_decay = []
     for name, param in model.named_parameters():
-        if name.endswith("project.weight"):
-            param.data *= 1 / (2 * num_layers) ** 0.5
-    
         if not param.requires_grad:
             continue
 
