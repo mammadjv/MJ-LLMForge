@@ -57,7 +57,11 @@ class CMHAttention(nn.Module):
             self.attention_mask = attention_mask
 
         if self.use_flash:
-            combined_tokens = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+            combined_tokens = F.scaled_dot_product_attention(q, k, v,
+                                                             attn_mask=active_mask,
+                                                             dropout_p=0.0 if not self.training else 0.1,
+                                                             is_causal=False,
+                                                            )
 
         else:
             # # compute attention matrix
@@ -79,6 +83,6 @@ class CMHAttention(nn.Module):
 
         # pass from fnn
         mlp_output = self.fnn(self.ln2(combined_tokens))  # (B, N, C)
-        out = x + mlp_output  # (B, N, C)
+        out = combined_tokens + mlp_output
 
         return out
