@@ -70,7 +70,7 @@ class GPTDataset(IterableDataset):
                 buf = torch.from_numpy(buf)
                 x = buf[:-1].view(B, T)
                 y = buf[1:].view(B, T)
-                yield x, y
+                yield (x,), y
                 pos += step
 
             shard_offset = 0
