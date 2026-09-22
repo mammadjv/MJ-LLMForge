@@ -77,29 +77,8 @@ def run_train(config, device, local_rank, global_rank, world_size):
     language_model.apply(utils.weights_init)
     language_model = language_model.to(device)
 
-    if trainer_mode == 'ddp':
-        language_model = DDP(language_model, device_ids=[local_rank])
-        decay, no_decay = utils.get_regularization_parameters(language_model, num_layers)
-        optimizer = bnb.optim.AdamW8bit([
-            {'params': decay, 'weight_decay': 0.1},
-            {'params': no_decay, 'weight_decay': 0.0},
-        ], betas=(0.9, 0.95), lr=base_lr)
-
-    else:
-        for layer in language_model.transformer.layers:
-            fully_shard(layer)
-    
-        fully_shard(language_model)
-        decay, no_decay = utils.get_regularization_parameters(language_model, num_layers)
-        optimizer = torch.optim.AdamW([
-            {'params': decay, 'weight_decay': 0.1},
-            {'params': no_decay, 'weight_decay': 0.0},
-        ], betas=(0.9, 0.95), lr=base_lr)
-
     loss_fn = nn.CrossEntropyLoss()
-
     llm_trainer = trainer.Trainer(language_model=language_model,
-                      optimizer=optimizer,
                       loss_fn=loss_fn,
                       device=device,
                       global_rank=global_rank,
@@ -144,7 +123,7 @@ def run_test(config, device, local_rank, global_rank, world_size):
     num_layers = config["num_layers"]
     use_checkpointing = config["use_checkpointing"]
     use_flash = config["use_flash"]
-    ckpt_path = config["ckpt_path"]
+    ckpt_path = config["best_ckpt_path"]
 
     vocab_len = config["vocab_len"]
 
