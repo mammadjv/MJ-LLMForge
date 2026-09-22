@@ -6,7 +6,6 @@ import time
 import re
 import string
 from collections import Counter
-from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -18,15 +17,13 @@ from torch.utils.data import DataLoader, DistributedSampler, random_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import RandomSampler
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-import bitsandbytes as bnb
 import tiktoken
-import matplotlib.pyplot as plt
 
 import qa_dataset
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from gpt.gpt import GPT
 from transformer import utils
+from transformer import trainer
 
 
 def normalize_answer(s):
@@ -57,36 +54,6 @@ def compute_f1(pred, truth):
     recall = num_same / len(truth_tokens)
 
     return 2 * precision * recall / (precision + recall)
-
-
-def load_state_dict_strip_module_qa(path, map_location="cpu"):
-    state_dict = torch.load(path, map_location=map_location)
-
-    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-        state_dict = state_dict["model_state_dict"]
-
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        k = k.replace("module.", "")
-
-        if "attention_mask" in k:
-            continue
-
-        new_state_dict[k] = v
-
-    return new_state_dict
-
-def load_state_dict_strip_module_gpt(path, map_location="cpu"):
-    """Loads a state_dict and strips a leading 'module.' if present."""
-    state_dict = torch.load(path, map_location=map_location)
-    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-        state_dict = state_dict["model_state_dict"]
-
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        new_state_dict[k.replace("module.", "")] = v
-    return new_state_dict
-
 
 def setup():
     dist.init_process_group(backend='nccl')
@@ -151,27 +118,32 @@ def validate(val_dataloader, language_model, device, global_rank, vocab_len, wor
 
 
 def run_train(config, device, local_rank, global_rank, world_size):
-    base_lr = config['base_lr']
-    seq_len = config['seq_len']
-    embed_dim = config['embed_dim']
-    num_heads = config['num_heads']
-    num_layers = config['num_layers']
+    base_lr = config["base_lr"]
+    seq_len = config["seq_len"]
+    embed_dim = config["embed_dim"]
+    num_heads = config["num_heads"]
+    num_layers = config["num_layers"]
+    trainer_mode = config['trainer_mode']
     n_frozen_layers = config['n_frozen_layers']
 
     iter_batch_size = config['iter_batch_size']
     actual_gpt_batch_size = config['actual_gpt_batch_size']
 
-    epochs = config['epochs']
     use_checkpointing = config['use_checkpointing']
     use_flash = config['use_flash']
+
     max_steps = config['max_steps']
     max_warmup_steps = config['max_warmup_steps']
     val_step = config['val_step']
-    lr_reduction_step = config['lr_reduction_step']
     num_workers = config['num_workers']
     data_dir = config['data_dir']
-    gpt_path = config['gpt_path']
+    gpt_path = config['ckpt_path']
     lora_rank = config['lora_rank']
+
+    qa_train_dataset = qa_dataset.QADataset(data_dir, 'train', iter_batch_size, seq_len, local_rank, world_size)
+    qa_val_dataset = qa_dataset.QADataset(data_dir, 'val', iter_batch_size, seq_len, local_rank, world_size)
+    vocab_len = qa_dataset.get_vocab_len()
+    config["vocab_len"] = vocab_len
 
     language_model = GPT(
         dictionary_length=vocab_len,
@@ -183,10 +155,18 @@ def run_train(config, device, local_rank, global_rank, world_size):
         use_flash=use_flash,
         lora_rank=lora_rank,
     )
+    language_model = language_model.to(device)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
 
-    grad_accum_steps = int(actual_gpt_batch_size/(seq_len * iter_batch_size * world_size)) #(2**12)/((2**10)*1*gpu_cores)
-    qa_train_dataset = qa_dataset.QADataset(data_dir, 'train', iter_batch_size, seq_len, local_rank, world_size)
-    qa_val_dataset = qa_dataset.QADataset(data_dir, 'val', iter_batch_size, seq_len, local_rank, world_size)
+    llm_trainer = trainer.Trainer(language_model=language_model,
+                      loss_fn=loss_fn,
+                      device=device,
+                      global_rank=global_rank,
+                      world_size=world_size,
+                      local_rank=local_rank,
+                      config=config,
+                      trainer_mode=trainer_mode,
+                     )
 
     train_dataloader = DataLoader(
         qa_train_dataset,
@@ -206,165 +186,10 @@ def run_train(config, device, local_rank, global_rank, world_size):
         persistent_workers=True
     )
 
-    gpt_state = load_state_dict_strip_module_gpt(gpt_path,
-                                         map_location="cpu",
-                                        )
-    language_model.load_state_dict(
-        gpt_state,
-        strict=False,
-    )
-    
-    if lora_rank > 0:   # LORA Finetuning
-        for param in language_model.parameters():
-            param.requires_grad = False
-
-        for name, param in language_model.named_parameters():
-            if any(x in name for x in ["Aq", "Bq", "Ak", "Bk", "Av", "Bv"]):
-                param.requires_grad = True
-
-    else:   # Traditional Finetuning
-        for layer in language_model.transformer.layers[:n_frozen_layers]:
-            for param in layer.parameters():
-                param.requires_grad = False
-
-    language_model = language_model.to(device)
-    language_model = DDP(
-        language_model,
-        device_ids=[local_rank],
-        broadcast_buffers=False,
-    )
-
-    decay, no_decay = utils.get_regularization_parameters(language_model, num_layers)
-
-
-    decay = [p for p in decay if p.requires_grad]
-    no_decay = [p for p in no_decay if p.requires_grad]
-
-    optimizer = bnb.optim.AdamW8bit([
-        {'params': decay, 'weight_decay': 0.1},
-        {'params': no_decay, 'weight_decay': 0.0},
-    ], lr=base_lr)
-
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
-    scaler = torch.amp.GradScaler()
-
-    step = 0
-    best_val_loss = float('inf')
-    total_train_loss = torch.zeros(1, device=device, dtype=torch.float32)
-    loss_accum_steps = torch.zeros(1, device=device, dtype=torch.float32)
-    valid_batch_count = torch.zeros(1, device=device, dtype=torch.float32)  # Track valid batches locally
-
-    optimizer.zero_grad()
-    optimizer = utils.optimizer_warmup(optimizer, base_lr, 1, max_warmup_steps)
-    first_clock = time.time()
-
-    while True:
-        if step // grad_accum_steps > max_steps:
-            break
-
-        for batch_idx, (inputs, labels, mask_y, causal_mask) in enumerate(train_dataloader):
-            step += 1
-            inputs = inputs.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            mask_y = mask_y.to(device, non_blocking=True)
-            labels[mask_y == -1] = -1
-
-            causal_mask = causal_mask.to(device, non_blocking=True).unsqueeze(1)
-
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                is_sync_step = (step % grad_accum_steps == 0)
-                language_model.require_backward_grad_sync = is_sync_step
-                outputs = language_model(inputs, causal_mask)
-                loss = loss_fn(outputs.view(-1, vocab_len), labels.view(-1))
-
-                if torch.isnan(loss):
-                    loss = outputs.sum() * 0.0
-
-                else:
-                    loss_accum_steps += loss.detach()
-                    valid_batch_count += 1.0
-
-                scaled_loss = loss / grad_accum_steps
-                scaler.scale(scaled_loss).backward()
-
-            if is_sync_step:
-                scaler.unscale_(optimizer)  # must unscale before clipping
-                torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-
-                # All-reduce losses and valid counts across all ranks
-                dist.all_reduce(loss_accum_steps, op=dist.ReduceOp.SUM)
-                dist.all_reduce(valid_batch_count, op=dist.ReduceOp.SUM)
-                
-                valid_batch_count = torch.clamp(valid_batch_count, min=1.0)
-                step_avg_loss = loss_accum_steps / valid_batch_count
-                total_train_loss += step_avg_loss
-
-                update_step = step // grad_accum_steps
-                if global_rank == 0:
-                    elapsed_time = time.time() - first_clock
-                    tokens_per_sec = (grad_accum_steps * iter_batch_size * seq_len * world_size) / elapsed_time
-                    print(f"\rStep {update_step}: Loss {step_avg_loss.item():.4f}, batch time {tokens_per_sec}, grad accum steps {grad_accum_steps}", end="", flush=True)
-                    first_clock = time.time()
-
-                loss_accum_steps.zero_()
-                valid_batch_count.zero_()
-                optimizer.zero_grad()
-
-                if update_step <= max_warmup_steps:
-                    optimizer = utils.optimizer_warmup(optimizer, base_lr, update_step, max_warmup_steps)
-                else:
-                    optimizer = utils.cosine_lr_update(optimizer, update_step, base_lr, max_steps, max_warmup_steps, min_lr=6e-5)
-
-                if update_step % val_step == 0:
-                    val_loss = validate(
-                        val_dataloader=val_dataloader,
-                        language_model=language_model,
-                        device=device,
-                        global_rank=global_rank,
-                        vocab_len=vocab_len,
-                        world_size=world_size,
-                    )
-
-                    dist.all_reduce(total_train_loss, op=dist.ReduceOp.SUM)
-                    total_train_loss /= (world_size * val_step)
-
-                    if global_rank == 0:
-                        print(f'\n Step {update_step}: avg train loss {total_train_loss.item()}, avg val loss {val_loss}', flush=True)
-            
-                    if val_loss < best_val_loss and global_rank == 0:
-                        best_val_loss = val_loss
-                        if lora_rank == 0:
-                            checkpoint = {
-                                'model_state_dict': language_model.module.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'step': step,
-                                'best_val_loss': best_val_loss,
-                            }
-                            torch.save(checkpoint, './best_model_qa_all_lora_{}.pt'.format(n_frozen_layers))
-
-                        else:
-                            lora_state_dict = {
-                                name: param.detach().cpu()
-                                for name, param in language_model.module.named_parameters()
-                                if any(key in name for key in ["Aq", "Bq", "Ak", "Bk", "Av", "Bv"])
-                            }
-
-                            checkpoint = {
-                                'model_state_dict': lora_state_dict,
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'step': step,
-                                'best_val_loss': best_val_loss,
-                                }
-
-                            torch.save(checkpoint, "lora_weights_{}.pt".format(lora_rank))
-
-                    total_train_loss.zero_()
-                    dist.barrier(device_ids=[local_rank])
-                    language_model.train()
-                    if update_step > max_steps:
-                        break
+    llm_trainer.update_dataloaders(train_dataloader,
+                                   val_dataloader,
+                                  )
+    llm_trainer.start()
 
 
 def run_test(config, device, local_rank):
@@ -376,13 +201,6 @@ def run_test(config, device, local_rank):
     use_flash = config['use_flash']
     data_dir = config['data_dir']
     gpt_path = config['gpt_path']
-
-    # checkpoints = [
-        # ('./best_model_qa_all_4.pt', 0),
-        # ('./best_model_qa_all_0.pt', 0),
-        # ('./lora_state_16.pt', 16),
-        # ('./lora_state_8.pt', 8),
-    # ]
 
     checkpoints = [
         ('./lora_weights_32.pt', 32),
@@ -518,6 +336,7 @@ if __name__ == "__main__":
 
     setup()
 
+    print('file = ', args.config)
     with open(args.config, "r") as f:
         config = json.load(f)
 
