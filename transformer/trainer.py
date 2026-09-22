@@ -1,8 +1,11 @@
 import time
+from collections import OrderedDict
 
+import bitsandbytes as bnb
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from torch.distributed.fsdp import fully_shard
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
@@ -11,12 +14,42 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions
 )
 
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformer import utils
+
+
+def load_state_dict_strip_module_qa(path, map_location="cpu"):
+    state_dict = torch.load(path, map_location=map_location)
+
+    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
+
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        k = k.replace("module.", "")
+
+        if "attention_mask" in k:
+            continue
+
+        new_state_dict[k] = v
+
+    return new_state_dict
+
+def load_state_dict_strip_module_gpt(path, map_location="cpu"):
+    """Loads a state_dict and strips a leading 'module.' if present."""
+    state_dict = torch.load(path, map_location=map_location)
+    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
+
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        new_state_dict[k.replace("module.", "")] = v
+    return new_state_dict
+
 
 class Trainer:
     def __init__(self,
                  language_model,
-                 optimizer,
                  loss_fn,
                  device,
                  global_rank,
@@ -26,7 +59,6 @@ class Trainer:
                  trainer_mode='ddp',
                 ):
         self.language_model = language_model
-        self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.scaler = torch.amp.GradScaler()
         self.global_rank=global_rank
@@ -37,8 +69,33 @@ class Trainer:
         self.train_dataloader = None
         self.val_dataloader = None
         self.config = config
+
         self.load_config()
-        self.load_checkpoint()
+
+        if self.trainer_mode == 'fsdp2':
+            self.configure_trainable_parameters()
+            
+            for layer in self.language_model.transformer.layers:
+                fully_shard(layer)
+
+            fully_shard(self.language_model)
+
+            self.create_optimizer()
+            self.load_checkpoint()
+        
+        else:
+            self.configure_trainable_parameters()
+            self.load_checkpoint()
+
+            self.language_model = DDP(
+                    self.language_model,
+                    device_ids=[self.local_rank],
+                    broadcast_buffers=False,
+                )
+            self.create_optimizer()
+            if self.optimizer_state_dict is not None:
+                self.optimizer.load_state_dict(self.optimizer_state_dict)
+
 
 
     def update_dataloaders(self,
@@ -47,6 +104,41 @@ class Trainer:
                           ):
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
+
+
+    def create_optimizer(self):
+        decay, no_decay = utils.get_regularization_parameters(self.language_model, self.config['num_layers'])
+    
+        if self.trainer_mode == 'ddp':
+            self.optimizer = bnb.optim.AdamW8bit([
+                {'params': decay, 'weight_decay': 0.1},
+                {'params': no_decay, 'weight_decay': 0.0}
+            ], lr=self.base_lr, betas=(0.9, 0.95))
+
+        else:
+            self.optimizer = torch.optim.AdamW([
+                {'params': decay, 'weight_decay': 0.1},
+                {'params': no_decay, 'weight_decay': 0.0}
+            ], lr=self.base_lr, betas=(0.9, 0.95))
+
+        self.optimizer = utils.optimizer_warmup(self.optimizer, self.base_lr, 1, self.max_warmup_steps)
+        
+    
+    def configure_trainable_parameters(self):
+        # finetune or not
+        if self.last_ckpt_path != "":
+            if self.config['lora_rank'] > 0:
+                for param in self.language_model.parameters():
+                    param.requires_grad = False
+        
+                for name, param in self.language_model.named_parameters():
+                    if any(x in name for x in ["Aq", "Bq", "Ak", "Bk", "Av", "Bv"]):
+                        param.requires_grad = True
+        
+            else:
+                for layer in self.language_model.transformer.layers[:self.config['n_frozen_layers']]:
+                    for param in layer.parameters():
+                        param.requires_grad = False
 
 
     def load_config(self):
@@ -61,77 +153,92 @@ class Trainer:
         self.iter_batch_size = self.config["iter_batch_size"]
         self.actual_gpt_batch_size = self.config["actual_gpt_batch_size"]
         self.grad_accum_steps = int(self.actual_gpt_batch_size/(self.seq_len * self.iter_batch_size * self.world_size))
-        self.ckpt_path = self.config['ckpt_path']
+        self.best_ckpt_path = self.config['best_ckpt_path']
+        self.current_ckpt_path = self.config['current_ckpt_path']
+        self.last_ckpt_path = self.config['last_ckpt_path']
 
 
     def load_checkpoint(self):
-        if not self.config['resume']:
-            self.step = 0
-            self.update_step = 0
-            self.best_val_loss = float('inf')
-            self.optimizer = utils.optimizer_warmup(self.optimizer, self.base_lr, 1, self.max_warmup_steps)
-    
-        else:
+        self.step = 0
+        self.update_step = 0
+        self.best_val_loss = float('inf')
+        self.optimizer_state_dict = None
+        
+        if self.last_ckpt_path != "":
             if self.trainer_mode == 'fsdp2':
                 if self.global_rank == 0:
-                    checkpoint = torch.load(self.config['ckpt_path'], map_location="cpu")
+                    checkpoint = torch.load(self.last_ckpt_path, map_location="cpu")
                     model_state_dict = checkpoint["model_state_dict"]
-                    optimizer_state_dict = checkpoint["optimizer_state_dict"]
-        
+    
+                    if self.config['resume']:
+                        optimizer_state_dict = checkpoint["optimizer_state_dict"]
+                    else:
+                        optimizer_state_dict = {}
+    
                 else:
                     checkpoint = None
                     model_state_dict = {}
                     optimizer_state_dict = {}
-            
+    
                 options = StateDictOptions(
                     full_state_dict=True,
                     broadcast_from_rank0=True,
+                    strict=False,
                 )
-            
+    
                 set_model_state_dict(
                     self.language_model,
                     model_state_dict,
                     options=options
                 )
-            
-                set_optimizer_state_dict(
-                    self.language_model,
-                    self.optimizer,
-                    optimizer_state_dict,
-                    options=options
-                )
-            
-                if self.global_rank == 0:
-                    metadata = {
-                        "step": checkpoint["step"],
-                        "update_step": checkpoint["update_step"],
-                        "best_val_loss": checkpoint["best_val_loss"],
-                        "scaler_state_dict": checkpoint["scaler_state_dict"],
-                    }
-
-                else:
-                    metadata = None
-            
-                metadata_list = [metadata]
-                dist.broadcast_object_list(metadata_list, src=0)
-                metadata = metadata_list[0]
-            
-                self.step = metadata["step"]
-                self.update_step = metadata["update_step"]
-                self.best_val_loss = metadata["best_val_loss"]
-                self.scaler.load_state_dict(metadata["scaler_state_dict"])
+    
+                if self.config['resume']:
+                    set_optimizer_state_dict(
+                        self.language_model,
+                        self.optimizer,
+                        optimizer_state_dict,
+                        options=options
+                    )
+    
+                    if self.global_rank == 0:
+                        metadata = {
+                            "step": checkpoint["step"],
+                            "update_step": checkpoint["update_step"],
+                            "best_val_loss": checkpoint["best_val_loss"],
+                            "scaler_state_dict": checkpoint["scaler_state_dict"],
+                        }
+    
+                    else:
+                        metadata = None
+    
+                    metadata_list = [metadata]
+                    dist.broadcast_object_list(metadata_list, src=0)
+                    metadata = metadata_list[0]
+    
+                    self.step = metadata["step"]
+                    self.update_step = metadata["update_step"]
+                    self.best_val_loss = metadata["best_val_loss"]
+                    self.scaler.load_state_dict(metadata["scaler_state_dict"])
     
             else:
-                checkpoint = torch.load(self.config['ckpt_path'], map_location=self.device)
-            
-                self.language_model.module.load_state_dict(checkpoint["model_state_dict"])
-                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-            
-                self.step = checkpoint["step"]
-                self.update_step = checkpoint["update_step"]
-                self.best_val_loss = checkpoint["best_val_loss"]
-                self.optimizer = utils.optimizer_warmup(self.optimizer, self.base_lr, 1, self.max_warmup_steps)
+                checkpoint = torch.load(self.last_ckpt_path, map_location="cpu")
+    
+                ckpt_state = load_state_dict_strip_module_gpt(
+                    self.last_ckpt_path,
+                    map_location="cpu",
+                )
+    
+                self.language_model.load_state_dict(
+                    ckpt_state,
+                    strict=False,
+                )
+    
+                if self.config['resume']:
+                    self.step = checkpoint["step"]
+                    self.update_step = checkpoint["update_step"]
+                    self.best_val_loss = checkpoint["best_val_loss"]
+                    self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                    self.optimizer_state_dict = checkpoint["optimizer_state_dict"]
 
 
     def validate(self):
@@ -208,9 +315,13 @@ class Trainer:
         
                     outputs = self.language_model(*inputs)
                     loss = self.loss_fn(outputs.view(-1, self.vocab_len), labels.view(-1))
-        
-                    loss_accum_steps += loss.detach()
-                    valid_batch_count += 1.0
+
+                    if torch.isnan(loss):
+                        loss = outputs.sum() * 0.0
+
+                    else:
+                        loss_accum_steps += loss.detach()
+                        valid_batch_count += 1.0
 
                     scaled_loss = loss / self.grad_accum_steps
                     self.scaler.scale(scaled_loss).backward()
@@ -286,32 +397,49 @@ class Trainer:
         
                         if self.global_rank == 0:
                             print(f'\n Step {self.update_step}: avg train loss {total_train_loss.item()}, avg val loss {val_loss}', flush=True)
-        
-                        if val_loss < self.best_val_loss:
-                            self.best_val_loss = val_loss
-                        
                             if self.trainer_mode == 'fsdp2':
                                 options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                        
                                 model_state_dict = get_model_state_dict(self.language_model, options=options)
                                 optimizer_state_dict = get_optimizer_state_dict(self.language_model, self.optimizer, options=options)
-                        
+
                             elif self.global_rank == 0:
                                 model_state_dict = self.language_model.module.state_dict()
                                 optimizer_state_dict = self.optimizer.state_dict()
-                        
+
                             if self.global_rank == 0:
-                                checkpoint = {
-                                    'model_state_dict': model_state_dict,
-                                    'optimizer_state_dict': optimizer_state_dict,
-                                    'scaler_state_dict': self.scaler.state_dict(),
-                                    'step': self.step,
-                                    'update_step': self.update_step,
-                                    'best_val_loss': self.best_val_loss,
-                                }
-                        
-                                torch.save(checkpoint, self.ckpt_path)
-            
+                                if self.config['lora_rank'] == 0:
+                                    checkpoint = {
+                                        'model_state_dict': model_state_dict,
+                                        'optimizer_state_dict': optimizer_state_dict,
+                                        'scaler_state_dict': self.scaler.state_dict(),
+                                        'step': self.step,
+                                        'update_step': self.update_step,
+                                        'best_val_loss': self.best_val_loss,
+                                    }
+    
+                                    torch.save(checkpoint, self.current_ckpt_path)
+                                    if val_loss < self.best_val_loss:
+                                        self.best_val_loss = val_loss
+                                        torch.save(checkpoint, self.best_ckpt_path)
+
+                                else:
+                                    lora_state_dict = {
+                                        name: param.detach().cpu()
+                                        for name, param in model_state_dict.items()
+                                        if any(key in name for key in ["Aq", "Bq", "Ak", "Bk", "Av", "Bv"])
+                                    }
+    
+                                    checkpoint = {
+                                        'model_state_dict': lora_state_dict,
+                                        'optimizer_state_dict': optimizer_state_dict,
+                                        'scaler_state_dict': self.scaler.state_dict(),
+                                        'step': self.step,
+                                        'update_step': self.update_step,
+                                        'best_val_loss': self.best_val_loss,
+                                        }
+    
+                                    torch.save(checkpoint, "lora_weights_{}.pt".format(self.config['lora_rank']))
+
                         total_train_loss.zero_()
                         dist.barrier(device_ids=[self.local_rank])
                         self.language_model.train()
