@@ -209,13 +209,15 @@ class QADataset(IterableDataset):
                 buf_tensor = torch.from_numpy(buf).view(B, T + 1)
 
                 x = buf_tensor[:, :-1]
-                y = buf_tensor[:, 1:]
+                y = buf_tensor[:, 1:].clone()
 
-                causal_mask = self.get_block_causal_mask(x, B, T)
+                causal_mask = self.get_block_causal_mask(x, B, T).unsqueeze(1)
                 mask_x = self.get_valid_tokens_mask(x, B, T)
                 mask_y = F.pad(mask_x[:, 1:], (0, 1), value=-1)
 
-                yield x, y, mask_y, causal_mask
+                y[mask_y == -1] = -1
+
+                yield (x, causal_mask), y
 
                 pos += tokens_per_batch
 
