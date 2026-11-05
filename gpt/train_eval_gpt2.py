@@ -2,7 +2,9 @@ import os
 import argparse
 import json
 import time
+import random
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -58,6 +60,11 @@ def run_train(config, device, local_rank, global_rank, world_size):
     num_workers = config['num_workers']
     trainer_mode = config['trainer_mode']
 
+    seed = config.get("seed", 1337)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     gpt_train_dataset = gpt_dataset.GPTDataset(data_dir, 'train', iter_batch_size, seq_len, global_rank, world_size, num_workers)
     gpt_val_dataset = gpt_dataset.GPTDataset(data_dir, 'val', iter_batch_size, seq_len, global_rank, world_size, num_workers)
 
@@ -75,7 +82,13 @@ def run_train(config, device, local_rank, global_rank, world_size):
     )
 
     language_model.apply(utils.weights_init)
+    utils.projection_scaling(language_model, config["num_layers"])
     language_model = language_model.to(device)
+
+    rank_seed = seed + 1000 + global_rank
+    random.seed(rank_seed)
+    np.random.seed(rank_seed)
+    torch.manual_seed(rank_seed)
 
     loss_fn = nn.CrossEntropyLoss()
     llm_trainer = trainer.Trainer(language_model=language_model,
