@@ -14,16 +14,38 @@ def weights_init(m):
         nn.init.zeros_(m.bias)
 
 
+@torch.no_grad()
+def projection_scaling(model, num_layers):
+    scale = (2 * num_layers) ** -0.5
+
+    for name, param in model.named_parameters():
+        if not name.startswith("transformer.layers."):
+            continue
+
+        if name.endswith((
+            ".project.weight",  # Attention output
+            ".fnn.2.weight",    # MLP output
+        )):
+            param.mul_(scale)
+
+
 def get_regularization_parameters(model, num_layers):
     decay = []
     no_decay = []
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
-        if param.ndim == 1 or "embed" in name or "bias" in name:
-            no_decay.append(param)
+        param_name = name.rsplit(".", 1)[-1]
 
+        if (
+            param.ndim <= 1
+            or "embed" in name
+            or param_name.endswith("bias")
+            or param_name in {"q_gamma", "k_gamma"}
+        ):
+            no_decay.append(param)
         else:
             decay.append(param)
 
@@ -37,12 +59,22 @@ def linear_lr_update(optimizer, e, base_lr, lr_reduction_epoch=3):
     return optimizer
 
 
-def cosine_lr_update(optimizer, step, base_lr, max_steps, max_warmup_steps, min_lr=6e-5):
-    t = step - max_warmup_steps
-    T = max_steps - max_warmup_steps
-    lr = min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * t / T))
-    for param in optimizer.param_groups:
-        param['lr'] = lr
+def cosine_lr_update(optimizer, step, base_lr, max_steps, max_warmup_steps, min_lr=2e-5):
+    if step >= max_steps:
+        lr = min_lr
+
+    else:
+        progress = (step - max_warmup_steps) / (
+            max_steps - max_warmup_steps
+        )
+        progress = max(0.0, min(1.0, progress))
+
+        lr = min_lr + 0.5 * (base_lr - min_lr) * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
     return optimizer
 
