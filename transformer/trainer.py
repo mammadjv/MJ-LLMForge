@@ -1,6 +1,9 @@
+import os
 import time
 from collections import OrderedDict
+import random
 
+import numpy as np
 import bitsandbytes as bnb
 import torch
 import torch.nn as nn
@@ -16,6 +19,43 @@ from torch.distributed.checkpoint.state_dict import (
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformer import utils
+
+
+
+def get_rng_state(device):
+    np_state = np.random.get_state()
+
+    return {
+        "python": random.getstate(),
+        "numpy": (
+            np_state[0],
+            np_state[1].tolist(),
+            np_state[2],
+            np_state[3],
+            np_state[4],
+        ),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state(device),
+    }
+
+
+def restore_rng_state(state, device):
+    random.setstate(state["python"])
+
+    n = state["numpy"]
+    np.random.set_state((
+        n[0],
+        np.asarray(n[1], dtype=np.uint32),
+        n[2],
+        n[3],
+        n[4],
+    ))
+
+    torch.set_rng_state(state["torch_cpu"])
+    torch.cuda.set_rng_state(
+        state["torch_cuda"],
+        device=device,
+    )
 
 
 def load_state_dict_strip_module_qa(path, map_location="cpu"):
@@ -69,6 +109,7 @@ class Trainer:
         self.train_dataloader = None
         self.val_dataloader = None
         self.config = config
+        self._resume_rng_state = None
 
         self.load_config()
 
@@ -136,6 +177,10 @@ class Trainer:
                         param.requires_grad = True
         
             else:
+                if self.config["n_frozen_layers"] > 0:
+                    self.language_model.embeddin_table.weight.requires_grad_(False)
+                    self.language_model.pos_embed.weight.requires_grad_(False)
+
                 for layer in self.language_model.transformer.layers[:self.config['n_frozen_layers']]:
                     for param in layer.parameters():
                         param.requires_grad = False
@@ -156,6 +201,14 @@ class Trainer:
         self.best_ckpt_path = self.config['best_ckpt_path']
         self.current_ckpt_path = self.config['current_ckpt_path']
         self.last_ckpt_path = self.config['last_ckpt_path']
+        self.lr_cosine_steps = self.config['lr_cosine_steps']
+
+        if self.config['lora_rank'] == 0:
+            suffix = f"_frozen_{self.config['n_frozen_layers']}"
+            root, ext = os.path.splitext(self.current_ckpt_path)
+            self.current_ckpt_path = f"{root}{suffix}{ext}"
+            root, ext = os.path.splitext(self.best_ckpt_path)
+            self.best_ckpt_path = f"{root}{suffix}{ext}"
 
 
     def load_checkpoint(self):
@@ -206,6 +259,10 @@ class Trainer:
                             "update_step": checkpoint["update_step"],
                             "best_val_loss": checkpoint["best_val_loss"],
                             "scaler_state_dict": checkpoint["scaler_state_dict"],
+                            "rng_states_by_rank": checkpoint.get(
+                                "rng_states_by_rank"
+                            ),
+                            "world_size": checkpoint.get("world_size"),
                         }
     
                     else:
@@ -219,33 +276,72 @@ class Trainer:
                     self.update_step = metadata["update_step"]
                     self.best_val_loss = metadata["best_val_loss"]
                     self.scaler.load_state_dict(metadata["scaler_state_dict"])
+                    if metadata.get("rng_states_by_rank") is not None:
+                        assert metadata.get("world_size", self.world_size) == self.world_size
+                    
+                        self._resume_rng_state = metadata[
+                            "rng_states_by_rank"
+                        ][self.global_rank]
     
-            else:
-                checkpoint = torch.load(self.last_ckpt_path, map_location="cpu")
-    
-                ckpt_state = load_state_dict_strip_module_gpt(
-                    self.last_ckpt_path,
-                    map_location="cpu",
-                )
-    
-                self.language_model.load_state_dict(
-                    ckpt_state,
-                    strict=False,
-                )
-    
-                if self.config['resume']:
-                    self.step = checkpoint["step"]
-                    self.update_step = checkpoint["update_step"]
-                    self.best_val_loss = checkpoint["best_val_loss"]
-                    self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-                    self.optimizer_state_dict = checkpoint["optimizer_state_dict"]
+            
+
+            else:  # DDP, fresh fine-tuning from a pretrained backbone
+                if self.global_rank == 0:
+                    print("Loading pretrained GPT checkpoint on rank 0...", flush=True)
+            
+                    checkpoint = torch.load(
+                        self.last_ckpt_path,
+                        map_location="cpu",
+                        mmap=True,
+                        weights_only=False,  # Only for checkpoints you trust
+                    )
+            
+                    state = checkpoint.get("model_state_dict", checkpoint)
+            
+                    state = {
+                        k.removeprefix("module."): v
+                        for k, v in state.items()
+                        if "attention_mask" not in k
+                    }
+            
+                    result = self.language_model.load_state_dict(
+                        state,
+                        strict=False,
+                    )
+            
+                    adapter_names = {"Aq", "Bq", "Ak", "Bk", "Av", "Bv"}
+            
+                    expected_missing = {
+                        name
+                        for name, _ in self.language_model.named_parameters()
+                        if name.rsplit(".", 1)[-1] in adapter_names
+                    }
+            
+                    if (
+                        set(result.missing_keys) != expected_missing
+                        or result.unexpected_keys
+                    ):
+                        raise RuntimeError(
+                            f"Checkpoint mismatch: "
+                            f"missing={result.missing_keys}, "
+                            f"unexpected={result.unexpected_keys}"
+                        )
+            
+                    del state, checkpoint
+                    print("Pretrained weights loaded successfully.", flush=True)
+            
+                # No manual broadcast needed here.
+                # The subsequent DDP constructor synchronizes model parameters
+                # from rank 0 to all other ranks.
+
+
 
 
     def validate(self):
         self.language_model.eval()
     
-        total_loss = torch.zeros(1, device=self.device, dtype=torch.float16)
-        count = torch.zeros(1, device=self.device, dtype=torch.float16)
+        total_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
+        count = torch.zeros(1, device=self.device, dtype=torch.float32)
     
         if self.global_rank == 0:
             print('')
@@ -285,7 +381,7 @@ class Trainer:
         if self.train_dataloader is None or self.val_dataloader is None:
             raise RuntimeError('Train and validation DataLoaders need to be initialized.')
 
-        total_train_loss = torch.zeros(1, device=self.device, dtype=torch.float16)
+        total_train_loss = torch.zeros(1, device=self.device, dtype=torch.float32)
         loss_accum_steps = torch.zeros(1, device=self.device, dtype=torch.float32)
         valid_batch_count = torch.zeros(1, device=self.device, dtype=torch.float32)
 
@@ -303,12 +399,20 @@ class Trainer:
                 self.step += 1
                 inputs, labels = self.prepare_inputs(inputs, labels)
         
+                if self._resume_rng_state is not None:
+                    restore_rng_state(
+                        self._resume_rng_state,
+                        self.device,
+                    )
+                    self._resume_rng_state = None
+
                 is_sync_step = (self.step % self.grad_accum_steps == 0)
                 current_update = self.step // self.grad_accum_steps
         
                 with torch.amp.autocast("cuda", dtype=torch.float16):
                     if self.trainer_mode == 'fsdp2':
                         self.language_model.set_requires_gradient_sync(is_sync_step)
+                        self.language_model.set_is_last_backward(is_sync_step)
 
                     else:
                         self.language_model.require_backward_grad_sync = is_sync_step
@@ -316,8 +420,11 @@ class Trainer:
                     outputs = self.language_model(*inputs)
                     loss = self.loss_fn(outputs.view(-1, self.vocab_len), labels.view(-1))
 
-                    if torch.isnan(loss):
-                        loss = outputs.sum() * 0.0
+                    if not torch.isfinite(loss).item():
+                        raise FloatingPointError(
+                            f"Nonfinite training loss at microbatch "
+                            f"{self.step}, rank {self.global_rank}"
+                        )
 
                     else:
                         loss_accum_steps += loss.detach()
@@ -328,7 +435,7 @@ class Trainer:
 
                 if is_sync_step:
                     self.scaler.unscale_(self.optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.language_model.parameters(), max_norm=1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.language_model.parameters(), max_norm=0.5)
 
                     if self.global_rank == 0:
                         grad_norm_item = grad_norm.item()
@@ -384,7 +491,7 @@ class Trainer:
                             self.optimizer,
                             self.update_step,
                             self.base_lr,
-                            self.max_steps,
+                            self.lr_cosine_steps,
                             self.max_warmup_steps,
                             min_lr=self.min_lr,
                         )
@@ -395,50 +502,82 @@ class Trainer:
                         dist.all_reduce(total_train_loss, op=dist.ReduceOp.SUM)
                         total_train_loss /= (self.world_size * self.val_step)
         
+                        is_best = val_loss < self.best_val_loss
+                        self.best_val_loss = min(self.best_val_loss, val_loss)
+
                         if self.global_rank == 0:
                             print(f'\n Step {self.update_step}: avg train loss {total_train_loss.item()}, avg val loss {val_loss}', flush=True)
-                            if self.trainer_mode == 'fsdp2':
-                                options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                                model_state_dict = get_model_state_dict(self.language_model, options=options)
-                                optimizer_state_dict = get_optimizer_state_dict(self.language_model, self.optimizer, options=options)
 
-                            elif self.global_rank == 0:
-                                model_state_dict = self.language_model.module.state_dict()
-                                optimizer_state_dict = self.optimizer.state_dict()
+                        if self.trainer_mode == 'fsdp2':
+                            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                            model_state_dict = get_model_state_dict(self.language_model, options=options)
+                            optimizer_state_dict = get_optimizer_state_dict(self.language_model, self.optimizer, options=options)
 
-                            if self.global_rank == 0:
-                                if self.config['lora_rank'] == 0:
-                                    checkpoint = {
-                                        'model_state_dict': model_state_dict,
-                                        'optimizer_state_dict': optimizer_state_dict,
-                                        'scaler_state_dict': self.scaler.state_dict(),
-                                        'step': self.step,
-                                        'update_step': self.update_step,
-                                        'best_val_loss': self.best_val_loss,
+                        elif self.global_rank == 0:
+                            model_state_dict = self.language_model.module.state_dict()
+                            optimizer_state_dict = self.optimizer.state_dict()
+
+                        # Every rank participates
+                        local_rng = get_rng_state(self.device)
+                        
+                        rng_states_by_rank = (
+                            [None] * self.world_size
+                            if self.global_rank == 0
+                            else None
+                        )
+                        
+                        dist.gather_object(
+                            local_rng,
+                            object_gather_list=rng_states_by_rank,
+                            dst=0,
+                        )
+                        if self.global_rank == 0:
+                            if self.config['lora_rank'] == 0:
+                                checkpoint = {
+                                    "model_state_dict": model_state_dict,
+                                    "optimizer_state_dict": optimizer_state_dict,
+                                    "scaler_state_dict": self.scaler.state_dict(),
+                                
+                                    "step": self.step,
+                                    "update_step": self.update_step,
+                                    "best_val_loss": self.best_val_loss,
+                                
+                                    # Reproducibility
+                                    "rng_states_by_rank": rng_states_by_rank,
+                                    "config": dict(self.config),
+                                    "world_size": self.world_size,
+                                    "torch_version": str(torch.__version__),
+                                }
+
+                                temp_path = self.current_ckpt_path + ".tmp"
+                                torch.save(checkpoint, temp_path)
+                                os.replace(temp_path, self.current_ckpt_path)
+
+                                if is_best:
+                                    best_temp = self.best_ckpt_path + ".tmp"
+                                    torch.save(checkpoint, best_temp)
+                                    os.replace(best_temp, self.best_ckpt_path)
+
+                            elif is_best:
+                                lora_state_dict = {
+                                    name: param.detach().cpu()
+                                    for name, param in model_state_dict.items()
+                                    if any(key in name for key in ["Aq", "Bq", "Ak", "Bk", "Av", "Bv"])
+                                }
+
+                                checkpoint = {
+                                    'model_state_dict': lora_state_dict,
+                                    'optimizer_state_dict': optimizer_state_dict,
+                                    'scaler_state_dict': self.scaler.state_dict(),
+                                    'step': self.step,
+                                    'update_step': self.update_step,
+                                    'best_val_loss': self.best_val_loss,
                                     }
-    
-                                    torch.save(checkpoint, self.current_ckpt_path)
-                                    if val_loss < self.best_val_loss:
-                                        self.best_val_loss = val_loss
-                                        torch.save(checkpoint, self.best_ckpt_path)
 
-                                else:
-                                    lora_state_dict = {
-                                        name: param.detach().cpu()
-                                        for name, param in model_state_dict.items()
-                                        if any(key in name for key in ["Aq", "Bq", "Ak", "Bk", "Av", "Bv"])
-                                    }
-    
-                                    checkpoint = {
-                                        'model_state_dict': lora_state_dict,
-                                        'optimizer_state_dict': optimizer_state_dict,
-                                        'scaler_state_dict': self.scaler.state_dict(),
-                                        'step': self.step,
-                                        'update_step': self.update_step,
-                                        'best_val_loss': self.best_val_loss,
-                                        }
-    
-                                    torch.save(checkpoint, "lora_weights_{}.pt".format(self.config['lora_rank']))
+                                torch.save(
+                                    checkpoint,
+                                    f"lora_weights_{self.config['lora_rank']}.pt"
+                                )
 
                         total_train_loss.zero_()
                         dist.barrier(device_ids=[self.local_rank])
