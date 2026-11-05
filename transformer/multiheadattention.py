@@ -14,6 +14,7 @@ class CMHAttention(nn.Module):
                  use_flash=True,
                  lora_rank=0,
                  lora_alpha=16,
+                 attention_dropout=0.0,
                 ):
         super(CMHAttention, self).__init__()
 
@@ -21,6 +22,7 @@ class CMHAttention(nn.Module):
         self.seq_len = seq_len
         self.num_heads = num_heads
         self.mlp_ratio = int(mlp_ratio)
+        self.attention_dropout = attention_dropout
 
         self.lora_rank = lora_rank
 
@@ -28,7 +30,17 @@ class CMHAttention(nn.Module):
         self.q = nn.Linear(self.embed_dim, self.embed_dim)
         self.v = nn.Linear(self.embed_dim, self.embed_dim)
 
-        attention_mask = torch.tril(torch.ones(1, self.num_heads, self.seq_len, self.seq_len, dtype=torch.bool))
+        self.head_dim = embed_dim // num_heads
+
+        # Learnable RMSNorm gains: [1, H, 1, head_dim]
+        self.q_gamma = nn.Parameter(
+            torch.ones(1, num_heads, 1, self.head_dim)
+        )
+        self.k_gamma = nn.Parameter(
+            torch.ones(1, num_heads, 1, self.head_dim)
+        )
+
+        attention_mask = torch.ones(1, 1, self.seq_len, self.seq_len, dtype=torch.bool).tril()
         self.register_buffer("attention_mask", attention_mask, persistent=False)
 
         if self.lora_rank > 0:
@@ -55,6 +67,17 @@ class CMHAttention(nn.Module):
 
         self.project = nn.Linear(self.embed_dim, self.embed_dim)
         self.lora_merged = False
+
+    @staticmethod
+    def qk_rms_norm(x, gamma, eps=1e-6):
+        dtype = x.dtype
+        x = x.float()
+    
+        x = x * torch.rsqrt(
+            x.square().mean(dim=-1, keepdim=True) + eps
+        )
+    
+        return (x * gamma.float()).to(dtype)
 
     def apply_lora(self):
         with torch.no_grad():
@@ -95,6 +118,10 @@ class CMHAttention(nn.Module):
             k = k + self.lora_scale * k_lora
             v = v + self.lora_scale * v_lora
 
+        # QK RMSNorm with trainable gamma
+        q = self.qk_rms_norm(q, self.q_gamma)
+        k = self.qk_rms_norm(k, self.k_gamma)
+
         active_mask = attention_mask if attention_mask is not None else self.attention_mask
 
         if active_mask.size(-1) > N:
@@ -103,7 +130,7 @@ class CMHAttention(nn.Module):
         if self.use_flash:
             combined_tokens = F.scaled_dot_product_attention(q, k, v,
                                                              attn_mask=active_mask,
-                                                             dropout_p=0.0 if not self.training else 0.1,
+                                                             dropout_p=0.0 if not self.training else self.attention_dropout,
                                                              is_causal=False,
                                                             )
 
