@@ -124,15 +124,26 @@ class QADataset(IterableDataset):
         k_ids = block_ids.unsqueeze(1)
     
         same_block = q_ids == k_ids
-    
         q_valid = valid_pos.unsqueeze(2)
         k_valid = valid_pos.unsqueeze(1)
-    
-        attn_mask_bool = same_block & q_valid & k_valid
-    
-        causal = torch.tril(torch.ones((T, T), device=x.device, dtype=torch.bool))
 
-        return torch.where(attn_mask_bool & causal, 0.0, float("-inf"))
+        causal = torch.tril(
+            torch.ones((T, T), device=x.device, dtype=torch.bool)
+        ).unsqueeze(0)
+
+        allowed = same_block & q_valid & k_valid & causal
+
+        # Invalid query positions attend only to themselves.
+        # They are ignored by the loss anyway.
+        identity = torch.eye(
+            T, device=x.device, dtype=torch.bool
+        ).unsqueeze(0)
+        
+        invalid_queries = ~valid_pos
+        
+        allowed |= identity & invalid_queries.unsqueeze(-1)
+        
+        return torch.where(allowed, 0.0, float("-inf"))
 
 
     def __iter__(self):
@@ -217,7 +228,8 @@ class QADataset(IterableDataset):
 
                 y[mask_y == -1] = -1
 
-                yield (x, causal_mask), y
+                if (y != -1).any():
+                    yield (x, causal_mask), y
 
                 pos += tokens_per_batch
 
