@@ -203,7 +203,7 @@ class Trainer:
         self.last_ckpt_path = self.config['last_ckpt_path']
         self.lr_cosine_steps = self.config['lr_cosine_steps']
 
-        if self.config['lora_rank'] == 0:
+        if self.config['lora_rank'] == 0 and self.config['n_frozen_layers'] > 0:
             suffix = f"_frozen_{self.config['n_frozen_layers']}"
             root, ext = os.path.splitext(self.current_ckpt_path)
             self.current_ckpt_path = f"{root}{suffix}{ext}"
