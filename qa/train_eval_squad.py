@@ -62,61 +62,6 @@ def setup():
 def cleanup():
     dist.destroy_process_group()
 
-def validate(val_dataloader, language_model, device, global_rank, vocab_len, world_size):
-    language_model.eval()
-
-    # Use float32 for accumulation
-    total_loss = torch.zeros(1, device=device, dtype=torch.float32)
-
-    total_tokens = torch.zeros(1, device=device, dtype=torch.float32)
-
-    # SUM instead of MEAN
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-1, reduction="sum")
-
-    if global_rank == 0:
-        print("")
-
-    stop_val_step = 50
-
-    with torch.no_grad():
-        for step, (inputs, labels, mask_y, causal_mask) in enumerate(val_dataloader, start=1):
-            inputs = inputs.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            mask_y = mask_y.to(device, non_blocking=True)
-            causal_mask = causal_mask.to(device, non_blocking=True).unsqueeze(1)
-
-            labels = labels.masked_fill(mask_y == -1, -1)
-            valid_tokens = (labels != -1).sum()
-
-            if valid_tokens.item() > 0:
-                with torch.amp.autocast("cuda", dtype=torch.float16):
-                    outputs = language_model(inputs, causal_mask)
-                    loss_sum = loss_fn(outputs.view(-1, vocab_len), labels.view(-1))
-
-                total_loss += loss_sum.detach().float()
-                total_tokens += valid_tokens.float()
-
-                if global_rank == 0:
-                    batch_avg = loss_sum.detach().float()/ valid_tokens.float()
-
-                    print(
-                        f"\rPerforming validation. "
-                        f"Iteration {step}: "
-                        f"Loss {batch_avg.item():.4f}",
-                        end="",
-                        flush=True,
-                    )
-
-            if step >= stop_val_step:
-                break
-
-    dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
-    avg_loss = total_loss / total_tokens.clamp_min(1)
-
-    return avg_loss.item()
-
-
 def run_train(config, device, local_rank, global_rank, world_size):
     base_lr = config["base_lr"]
     seq_len = config["seq_len"]
@@ -137,7 +82,6 @@ def run_train(config, device, local_rank, global_rank, world_size):
     val_step = config['val_step']
     num_workers = config['num_workers']
     data_dir = config['data_dir']
-    gpt_path = config['ckpt_path']
     lora_rank = config['lora_rank']
 
     qa_train_dataset = qa_dataset.QADataset(data_dir, 'train', iter_batch_size, seq_len, local_rank, world_size)
@@ -200,14 +144,13 @@ def run_test(config, device, local_rank):
     use_checkpointing = config['use_checkpointing']
     use_flash = config['use_flash']
     data_dir = config['data_dir']
-    gpt_path = config['gpt_path']
 
     checkpoints = [
         ('./lora_weights_32.pt', 32),
         ('./lora_weights_8.pt', 8),
         ('./lora_weights_16.pt', 16),
-        ('./best_model_qa_all_lora_8.pt', 0),
-        ('./best_model_qa_all_lora_16.pt', 0),
+        ('./best_model_nxl5_frozen_8.pt', 0),
+        ('./best_model_nxl5_frozen_16.pt', 0),
     ]
 
     for ckpt_path, lora_rank in checkpoints:
@@ -331,6 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--lora_rank", type=int, default=None)
     parser.add_argument("--n_frozen_layers", type=int, default=None)
+    parser.add_argument("--iter_batch_size", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -346,6 +290,9 @@ if __name__ == "__main__":
 
     if args.n_frozen_layers is not None:
         config["n_frozen_layers"] = args.n_frozen_layers
+
+    if args.iter_batch_size is not None:
+        config["iter_batch_size"] = args.iter_batch_size
 
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = dist.get_world_size()
