@@ -1,10 +1,10 @@
 # SQuAD 2.0 Question Answering — Fine-Tuning a GPT Trained from Scratch
 
-**A controlled comparison of Low-Rank Adaptation (LoRA) and partial Transformer fine-tuning for context-conditioned question answering.**
+**A comparison of LoRA and partial fine-tuning on a GPT pretrained from scratch, followed by a matched-task benchmark against the original pretrained GPT-2 XL.**
 
-This phase of [MJ-LLMForge](https://github.com/mammadjv/MJ-LLMForge) adapts a custom, pretrained, decoder-only GPT to SQuAD-style QA. The implementation includes answer-only supervised learning, block-causal masking for packed examples, multi-GPU training, low-rank attention adapters, adapter merging, and autoregressive evaluation of both answerable and unanswerable questions.
+This phase of [MJ-LLMForge](https://github.com/mammadjv/MJ-LLMForge) adapts a custom decoder-only GPT pretrained from scratch to SQuAD-style QA and compares it with the public, originally pretrained GPT-2 XL under a closely matched downstream protocol. The implementation includes answer-only supervised learning, block-causal masking for packed examples, multi-GPU training, low-rank attention adapters, adapter merging, and autoregressive evaluation of both answerable and unanswerable questions.
 
-> **Scope of reported results:** These are **project-internal results on 3,000 questions from a custom, shard-based holdout of the SQuAD 2.0 training split**. They are **not official SQuAD 2.0 development or test-set scores**. All five checkpoints were evaluated on the same subset with the same decoding and scoring procedure.
+> **Scope of reported results:** These are **project-internal results on 3,000 questions from a custom, shard-based holdout of the SQuAD 2.0 training split**. They are **not official SQuAD 2.0 development or test-set scores**. Five from-scratch GPT checkpoints and three pretrained GPT-2 XL LoRA checkpoints were evaluated on the same 3,000-question subset using corresponding greedy-decoding and EM/F1 scoring procedures.
 
 ## Table of Contents
 
@@ -13,6 +13,12 @@ This phase of [MJ-LLMForge](https://github.com/mammadjv/MJ-LLMForge) adapts a cu
   - [Aggregate Exact Match and F1](#aggregate-exact-match-and-f1)
   - [Answerable vs. unanswerable questions](#answerable-vs-unanswerable-questions)
   - [What the score differences mean](#what-the-score-differences-mean)
+- [GPT-2 XL reference baseline](#gpt-2-xl-reference-baseline)
+  - [Limited pretraining budget and model alignment](#limited-pretraining-budget-and-model-alignment)
+  - [Matched-rank LoRA evaluation](#matched-rank-lora-evaluation)
+  - [Answerability: what is and is not replicated](#answerability-what-is-and-is-not-replicated)
+  - [GPT-2 XL training order, loss curves, and checkpoint selection](#gpt-2-xl-training-order-loss-curves-and-checkpoint-selection)
+  - [Scope and methodological limitations](#scope-and-methodological-limitations)
 - [Model and supervised QA objective](#model-and-supervised-qa-objective)
   - [Prompt representation](#prompt-representation)
   - [Answer-only loss and block-causal masking](#answer-only-loss-and-block-causal-masking)
@@ -29,18 +35,20 @@ This phase of [MJ-LLMForge](https://github.com/mammadjv/MJ-LLMForge) adapts a cu
   - [Validation-loss curves](#validation-loss-curves)
   - [Checkpoint selection and overfitting](#checkpoint-selection-and-overfitting)
 - [Reproduction](#reproduction)
+  - [GPT-2 XL baseline commands](#gpt-2-xl-baseline-commands)
 
 ## Overview and key findings
 
 The 3,000-example evaluation contains **2,461 answerable questions (82.03%)** and **539 unanswerable questions (17.97%)**. A correct answer to an unanswerable question is an **empty generated response** (after normalization), represented in the training data by an empty answer field followed by the end-of-text token.
 
-Three observations define the comparison:
+Four observations define the comparison:
 
 1. **LoRA rank 16 has the highest aggregate scores:** **60.20% Exact Match (EM)** and **67.16% token-level F1**. LoRA rank 32 is extremely close at 60.03% EM / 66.86% F1.
 2. **Partial fine-tuning with the first 16 layers frozen is strongest on answerable questions:** **62.33% answerable EM** and **71.04% answerable F1**. However, it correctly abstains on only **36.73%** of unanswerable examples.
-3. **Abstention changes the overall ranking:** LoRA rank 16 correctly abstains on **61.97%** of unanswerable questions. Its advantage on this subset outweighs its smaller disadvantage on answerable questions.
+3. **A strong GPT-2 XL reference baseline is closely approached on this task:** on the same evaluation, the original GPT-2 XL achieves **63.23% EM** at rank 32 and **68.52% F1** at rank 16, versus **60.20% EM / 67.16% F1** for the best from-scratch checkpoint (rank 16).
+4. **Answerability drives much of the remaining gap:** the custom rank-32 GPT has **68.95% answerable F1**, exceeding GPT-2 XL rank 32's **67.95%**, while GPT-2 XL leads on unanswerable EM by **13.54 percentage points** at that rank. The custom foundation model was pretrained for only **approximately one-fifth of a single pass through its pretraining dataset**, as reported for this project; that refers to **foundation pretraining**, not to SQuAD LoRA fine-tuning.
 
-These results compare *different adaptation scopes*, not just parameter counts: LoRA modifies Q/K/V projections with low-rank updates, whereas partial fine-tuning updates original parameters in selected Transformer blocks.
+These results compare *different adaptation scopes*, not just parameter counts: LoRA modifies attention projections with low-rank updates, whereas partial fine-tuning updates original parameters in selected Transformer blocks. The GPT-2 XL comparison is a **near-reproduction of downstream task behavior**, not a literal replication of architecture, adapter parameterization, pretraining corpus, or pretraining budget.
 
 ## Evaluation results
 
@@ -85,6 +93,78 @@ Thus, the rank-16 LoRA adapter answers **62 fewer answerable questions exactly**
 This is an *answerability trade-off*, not proof that one adaptation method intrinsically understands when to abstain. For example, a checkpoint can look good on unanswerable examples simply by being more inclined to terminate early. To test that possibility, the evaluator would need to measure **false abstention on answerable questions** separately from **wrong nonempty answers**.
 
 The evaluation-set composition also matters. These aggregate scores weight answerable questions about **4.57×** as heavily as unanswerable questions because of their frequencies; a different mixture could change the ranking. The earlier 1,000-example evaluation happened to contain only answerable cases, explaining why its ranking differed from the expanded 3,000-example evaluation.
+
+
+## GPT-2 XL reference baseline
+
+### Limited pretraining budget and model alignment
+
+The central question is whether the **custom GPT foundation model, trained from scratch**, has learned representations that transfer competitively to SQuAD question answering compared with the public, originally pretrained [`openai-community/gpt2-xl`](https://huggingface.co/openai-community/gpt2-xl). The custom model's **foundation-model pretraining covered approximately one-fifth of a full epoch / one pass over its pretraining corpus**, as reported by the project author. **This ~0.2-epoch statement concerns the earlier language-model pretraining stage, *not* the 10,000-step SQuAD fine-tuning experiments**, and does not describe GPT-2 XL's pretraining budget. The attached QA logs do not independently establish the pretraining token count; thus the fraction is reported rather than calculated from these logs.
+
+Both models use 48 transformer blocks, a width of 1,600, 25 attention heads, GPT-2 BPE tokens, and a 1,024-token maximum sequence length. The custom model's vocabulary is padded to 50,304 tokens, while the original GPT-2 XL vocabulary contains 50,257. Similar macro-architecture and a shared QA protocol make this a useful **downstream representation and adaptation benchmark**, but they do not prove the architectures or their original pretraining procedures are identical.
+
+The GPT-2 XL baseline reuses the project's original packed `qa_dataset.QADataset`, including its train/validation/test shards, per-example block-causal attention masks, and **answer-token-only cross-entropy** (`ignore_index=-1`) on already-shifted targets. Both models use the same **nominal 32,768 tokens per optimizer update** for the LoRA runs and both evaluate the first 3,000 held-out examples through greedy generation to EOT or 150 new tokens. These choices control much of the downstream protocol, although optimizer implementation and low-rank adaptation details still differ.
+
+### Matched-rank LoRA evaluation
+
+![Overall Exact Match comparison between the from-scratch GPT and the originally pretrained GPT-2 XL for matched LoRA ranks](assets/gpt2xl_vs_scratch_em.png)
+
+![Overall F1 comparison between the from-scratch GPT and the originally pretrained GPT-2 XL for matched LoRA ranks](assets/gpt2xl_vs_scratch_f1.png)
+
+| LoRA rank | Model initialization | Overall EM | Overall F1 | Answerable EM | Answerable F1 | Unanswerable EM / F1 |
+|:--|:--|--:|--:|--:|--:|--:|
+| 8 | GPT trained from scratch | 57.57% | 64.55% | 56.97% | 65.48% | 60.30% |
+| 8 | **Original GPT-2 XL** | **62.10%** | **68.07%** | **62.58%** | **69.86%** | 59.93% |
+| 16 | GPT trained from scratch | 60.20% | 67.16% | 59.81% | 68.30% | 61.97% |
+| 16 | **Original GPT-2 XL** | **62.43%** | **68.52%** | **61.68%** | **69.11%** | **65.86%** |
+| 32 | GPT trained from scratch | 60.03% | 66.86% | 60.63% | **68.95%** | 57.33% |
+| 32 | **Original GPT-2 XL** | **63.23%** | **68.47%** | **61.56%** | 67.95% | **70.87%** |
+
+**Best-observed overall scores (across the three ranks):** from-scratch GPT **60.20% EM / 67.16% F1** (both rank 16); GPT-2 XL **63.23% EM** (rank 32) and **68.52% F1** (rank 16). The corresponding gaps are **3.03 percentage points in EM** and **1.36 percentage points in F1**. These aggregate comparisons select potentially different ranks; matched-rank rows above are more controlled.
+
+At matched **rank 32**, GPT-2 XL correctly answers **1,897/3,000** examples exactly versus **1,801/3,000** for the from-scratch GPT. The **96-extra-exact-match** difference comes from **23 additional exact matches on answerable questions** (1,515 vs. 1,492 of 2,461) and **73 additional correct empty responses on unanswerable questions** (382 vs. 309 of 539). Approximately **76% of the exact-match advantage comes from unanswerable cases**. Counts are derived from the reported percentages and the fixed subset sizes.
+
+### Answerability: what is and is not replicated
+
+![Answerable F1 for the two foundation-model initializations under matching LoRA ranks](assets/gpt2xl_vs_scratch_answerable_f1.png)
+
+![Unanswerable exact-match accuracy for the two foundation-model initializations under matching LoRA ranks](assets/gpt2xl_vs_scratch_unanswerable_em.png)
+
+**What is nearly reproduced:** With rank 32, the custom GPT scores **68.95% F1 on answerable questions**, **1.00 percentage point higher** than the originally pretrained GPT-2 XL's **67.95%** under the corresponding rank-32 adapter. The custom GPT does *not* lead on answerable Exact Match (60.63% vs. GPT-2 XL's 61.56%), and at ranks 8 and 16 GPT-2 XL leads on answerable F1. A separate custom *partial fine-tuning* checkpoint (first 16 blocks frozen) reaches **71.04% answerable F1**, but it is not an adaptation-matched comparison against GPT-2 XL LoRA.
+
+**Where replication remains incomplete:** At rank 32, correct abstention on unanswerable questions is **57.33%** for the custom GPT versus **70.87%** for GPT-2 XL—a **13.54-point** gap. This specific distinction is the dominant contributor to their overall EM difference. Rank-16 abstention is closer (**61.97%** vs. **65.86%**), while at rank 8 the custom GPT is marginally higher (**60.30%** vs. **59.93%**). Therefore the statement that the custom model performs better on answerable questions but worse on unanswerable questions **applies most clearly to rank-32 answerable F1 and unanswerable EM**, not uniformly to every rank or metric.
+
+These results show **strong transfer of answer-extraction capability from a model with limited pretraining exposure**, together with a measurable difference in answerability handling. An empty response can reflect the model's tendency to terminate rather than calibrated knowledge of answer absence; future evaluation could add false-abstention and false-answer rates on individual examples to distinguish these behaviors.
+
+### GPT-2 XL training order, loss curves, and checkpoint selection
+
+The full provided GPT-2 XL training log contains **three sequential 10,000-optimizer-step LoRA runs in this order: rank 32, rank 16, rank 8**. Each run logs **501 training-loss samples** (step 1, then every 20 steps) and **50 validation-loss samples** (every 200 steps). These are *QA adaptation* experiments on the pretrained GPT-2 XL, not foundation-model pretraining from scratch.
+
+| Run order | Method | Trainable adapter parameters | Nominal tokens/update | Best validation step | Minimum val loss | Val loss at step 10,000 |
+|:--|:--|--:|--:|--:|--:|--:|
+| 1 | GPT-2 XL · LoRA r=32 | 9,830,400 (0.627%) | 32,768 | 5,600 | **0.33696** | 0.34261 |
+| 2 | GPT-2 XL · LoRA r=16 | 4,915,200 (0.315%) | 32,768 | 6,200 | 0.34004 | 0.34118 |
+| 3 | GPT-2 XL · LoRA r=8 | 2,457,600 (0.158%) | 32,768 | 10,000 | 0.35935 | 0.35935 |
+
+The logs confirm a microbatch of **4 packed sequences per GPU**, **2 accumulation microsteps**, **4 GPUs**, and **sequence length 1,024**, giving `4 × 2 × 4 × 1,024 = 32,768` nominal input tokens per optimizer update. The reported trainable-parameter counts are from the GPT-2 XL/PEFT runs; matching rank is **not** equivalent to identical adapter parameter counts in the custom Q/K/V implementation.
+
+![Raw GPT-2 XL per-step training loss curves for LoRA ranks 32, 16, and 8](assets/gpt2xl_training_loss.png)
+
+![GPT-2 XL validation loss curves from step 400 onward, with minimum checkpoints highlighted for LoRA ranks 32, 16, and 8](assets/gpt2xl_validation_loss.png)
+
+The GPT-2 XL validation-loss plot zooms to **step 400 onward** so the later convergence is visible; all step-200 validation values remain in the bundled CSV. All three reference baselines improve markedly during SQuAD adaptation. **Rank 32's validation loss at step 1,400 was 0.38035**, but it continued to improve to **0.33696 at step 5,600**; the initial step-1,400 snapshot was **not** the eventual best checkpoint. The minimum recorded loss for rank 16 is 0.34004 at step 6,200, while rank 8 finishes at its minimum of 0.35935 at step 10,000. Rank 32 has the lowest observed QA validation loss, but **rank 16 has the highest overall test F1**, again showing that validation likelihood and task metrics need not rank checkpoints identically.
+
+![Validation loss over time, comparing the custom from-scratch GPT and pretrained GPT-2 XL for the same LoRA ranks](assets/gpt2xl_vs_scratch_validation_loss.png)
+
+The custom GPT's minimum LoRA validation losses were **0.47004 (r=32, step 1,400)**, **0.47809 (r=16, step 2,600)**, and **0.48506 (r=8, step 2,800)**. GPT-2 XL reaches lower teacher-forced validation losses and its best points occur later for all three ranks. Despite this probability-level advantage, the difference in final greedy-decoded EM/F1 is appreciably smaller. **Validation loss is answer-token cross-entropy, not the same quantity as Exact Match or F1.** The two training logs also use different summary conventions: the custom trainer logs average training loss every 200 steps, while the GPT-2 XL trainer reports a per-step training loss every 20 steps. The curves should not be interpreted as identical smoothing or sampling processes.
+
+### Scope and methodological limitations
+
+- **Same downstream task, different pretrained checkpoints:** The GPT-2 XL starting weights came from the public pretrained model; the custom model's original pretraining is author-reported at ~0.2 corpus epoch. The two pretraining data distributions, token exposures, compute, and optimization histories have not been equated. The result is not an estimate of compute efficiency relative to GPT-2 XL's original pretraining.
+- **Architecture and LoRA details:** The custom implementation uses separate Q/K/V projection adapters, while GPT-2 XL applies a PEFT adapter to its fused `c_attn` QKV projection. Nominal rank 8/16/32 is matched, but parameter counts, projection structure, and details of normalization/position representations may differ.
+- **Distributed training:** The custom fine-tuning experiments used DDP; the GPT-2 XL baseline used FSDP2, with FP16 mixed precision and its own checkpoint-saving path. The baseline's final parameters were restored from each run's **best-validation checkpoint**, not necessarily the last step.
+- **Holdout methodology:** The 3,000-question set is an *internal shard-based split of SQuAD 2.0 training data*, uses just one serialized reference answer, and preserves shard order. It is not an official dev/test benchmark, and article/context overlap between shards is possible.
+- **Scope of conclusion:** Close answerable F1 for one matched rank is strong evidence that this implementation can reproduce a substantial fraction of GPT-2 XL's **downstream QA behavior after adaptation**. It is not proof of nearly identical base-model language understanding, model internals, or general benchmark performance. A paired per-example error analysis and independent held-out language-model loss/perplexity would strengthen the foundation-model comparison.
 
 ## Model and supervised QA objective
 
@@ -296,4 +376,30 @@ Replace `<evaluation-script>.py` with the standalone evaluation script used in t
 
 The test code checks the expected model/adaptor keys, loads pretrained GPT weights before LoRA weights, and calls `apply_lora()` before inference. For partial-FT models it loads the fine-tuned model state directly.
 
-To embed the plots in a GitHub README, retain the four PNGs in the repository's `assets/` directory alongside this file; Markdown image references use **relative paths**.
+### GPT-2 XL baseline commands
+
+Run all three reference-baseline experiments using the **same `config.json`, packed dataset, and 4-GPU launch** (your local copy of the packed GPT-2 XL trainer may be named `train_eval_squad_gpt2xl.py`):
+
+```bash
+# Run in this order: r=32, then r=16, then r=8
+for r in 32 16 8; do
+  torchrun --standalone --nproc_per_node=4 \
+    train_eval_squad_gpt2xl.py --phase train --config config.json \
+    --lora_rank "$r" --n_frozen_layers 0
+done
+```
+
+Evaluate each best-validation checkpoint on exactly the same 3,000 examples (one GPU):
+
+```bash
+for r in 32 16 8; do
+  torchrun --standalone --nproc_per_node=1 \
+    train_eval_squad_gpt2xl.py --phase test --config config.json \
+    --lora_rank "$r" --test_limit 3000 \
+    --checkpoint "gpt2xl_qa/lora_rank${r}_best.pt"
+done
+```
+
+The evaluation JSON outputs are written as `gpt2xl_qa/lora_rank{r}_qa_inference_results.json`. In Slurm, use the same launch/environment configuration as the project's existing distributed job rather than assuming `--standalone` handles multi-node placement. The **three GPT-2 XL training curves** in this README are reproduced from the supplied log; the `data/` files in the downloadable README bundle preserve the underlying loss and evaluation series for future graph updates.
+
+To embed all plots in a GitHub README, retain **all chart PNGs** in the repository's `assets/` directory alongside this file; Markdown image references use **relative paths**.
