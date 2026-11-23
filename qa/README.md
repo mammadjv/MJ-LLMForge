@@ -204,11 +204,13 @@ In the actual preprocessing code the answer begins after `"Answer: "`, so an emp
 
 The supervised objective trains the model to **predict answer tokens**, including the terminating end-of-text token. Context and question tokens provide conditioning information but are ignored by the supervised cross-entropy loss:
 
-$$
-\mathcal{L}_{\mathrm{QA}} = -\frac{1}{|\mathcal{A}|}\sum_{t\in\mathcal{A}}\log p_{\theta}(x_t\mid x_{<t}),
-$$
+In words, the QA training loss is the **average negative log-likelihood over only the answer and end-of-text target positions**.
 
-where $\mathcal{A}$ is the set of supervised answer/EOT target positions. Positions outside $\mathcal{A}$ use `ignore_index = -1`.
+- Let `A` be the set of supervised answer/EOT target positions.
+- For each target position `t` in `A`, the model predicts token `x_t` conditioned on all previous visible tokens `x_<t`.
+- The loss is the average of `-log p_theta(x_t | x_<t)` over all positions in `A`.
+- All positions outside `A` are ignored with `ignore_index = -1`.
+
 
 Because individual QA examples are packed together in fixed-length token windows, the dataloader also constructs a **block-causal attention mask**. A query can attend only to earlier positions **within the same `Context:` block**. This prevents one packed QA example from reading tokens from an unrelated example in the same training sequence. The implementation excludes incomplete terminal blocks from the supervised mask.
 
@@ -231,15 +233,13 @@ Parameters outside these blocks may remain trainable depending on their `require
 
 With `lora_rank > 0`, the pretrained matrices remain frozen and learnable low-rank factors are attached to the **query (Q), key (K), and value (V)** attention projections. Tested ranks: **8, 16, 32**.
 
-For a pretrained projection $W$, the adapted projection is:
+For a pretrained projection `W`, the adapted projection is:
 
-$$
-W_{\mathrm{adapted}}=W+sBA,
-$$
+`W_adapted = W + sBA`
 
-where $A$ and $B$ are trainable low-rank factors, $\mathrm{rank}(BA)\le r$, and $s$ denotes the implementation's adapter scaling.
+where `A` and `B` are trainable low-rank factors, `rank(BA) <= r`, and `s` denotes the implementation's adapter scaling.
 
-At inference, the project's `apply_lora()` operation **merges** the learned $BA$ updates into the pretrained Q/K/V weights, so the model can generate without recomputing an adapter branch at each token.
+At inference, the project's `apply_lora()` operation **merges** the learned `BA` updates into the pretrained Q/K/V weights, so the model can generate without recomputing an adapter branch at each token.
 
 This is a comparison of **LoRA on Q/K/V throughout the network** versus **direct weight updates in unfrozen Transformer blocks**. It is *not* an equal-parameter comparison, and the code/logs supplied do not establish exact parameter counts or peak VRAM for each configuration.
 
@@ -297,9 +297,7 @@ Training was performed using **PyTorch Distributed Data Parallel (DDP) across fo
 
 For fixed-length packed sequences, the nominal token count per optimizer update is:
 
-$$
-N_{\mathrm{tokens/update}}=\text{seq\_len}\times\text{local batch size}\times\text{GPU count}\times\text{accumulation steps}.
-$$
+`N_tokens_per_update = seq_len × local_batch_size × GPU_count × accumulation_steps`
 
 This counts packed input positions, **not necessarily the number of supervised answer tokens** remaining after masking.
 
