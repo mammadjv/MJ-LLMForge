@@ -2,6 +2,7 @@ import math
 
 import torch.nn as nn
 import torch
+import bitsandbytes as bnb
 
 def weights_init(m):
     if isinstance(m, (nn.Linear, nn.Embedding)):
@@ -102,3 +103,29 @@ def top_k_sampling(logits, k=10, temperature=0.8):
     probs = torch.softmax(logits, dim=-1)
     next_token = torch.multinomial(probs, num_samples=1)
     return next_token
+
+
+def replace_with_4bit(module):
+    for name, child in list(module.named_children()):
+        if isinstance(child, bnb.nn.Linear4bit):
+            continue
+
+        if type(child) is nn.Linear:
+            if any(p.requires_grad for p in child.parameters()):
+                continue
+
+            new_layer = bnb.nn.Linear4bit(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                compute_dtype=torch.float16,
+                quant_type="nf4",
+                compress_statistics=True,
+            )
+
+            new_layer.load_state_dict(child.state_dict())
+            new_layer.requires_grad_(False)
+            setattr(module, name, new_layer)
+
+        else:
+            replace_with_4bit(child)

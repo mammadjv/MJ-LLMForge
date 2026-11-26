@@ -115,7 +115,7 @@ class Trainer:
 
         if self.trainer_mode == 'fsdp2':
             self.configure_trainable_parameters()
-            
+
             for layer in self.language_model.transformer.layers:
                 fully_shard(layer)
 
@@ -123,16 +123,20 @@ class Trainer:
 
             self.create_optimizer()
             self.load_checkpoint()
-        
+
         else:
             self.configure_trainable_parameters()
             self.load_checkpoint()
+            if self.config['lora_rank'] > 0 and self.config['qlora'] == True:
+                utils.replace_with_4bit(self.language_model.transformer)
 
+            self.language_model.to(self.local_rank)
             self.language_model = DDP(
                     self.language_model,
                     device_ids=[self.local_rank],
                     broadcast_buffers=False,
                 )
+
             self.create_optimizer()
             if self.optimizer_state_dict is not None:
                 self.optimizer.load_state_dict(self.optimizer_state_dict)
@@ -149,7 +153,7 @@ class Trainer:
 
     def create_optimizer(self):
         decay, no_decay = utils.get_regularization_parameters(self.language_model, self.config['num_layers'])
-    
+
         if self.trainer_mode == 'ddp':
             self.optimizer = bnb.optim.AdamW8bit([
                 {'params': decay, 'weight_decay': 0.1},
@@ -163,19 +167,19 @@ class Trainer:
             ], lr=self.base_lr, betas=(0.9, 0.95))
 
         self.optimizer = utils.optimizer_warmup(self.optimizer, self.base_lr, 1, self.max_warmup_steps)
-        
-    
+
+
     def configure_trainable_parameters(self):
         # finetune or not
         if self.last_ckpt_path != "":
             if self.config['lora_rank'] > 0:
                 for param in self.language_model.parameters():
                     param.requires_grad = False
-        
+
                 for name, param in self.language_model.named_parameters():
                     if any(x in name for x in ["Aq", "Bq", "Ak", "Bk", "Av", "Bv"]):
                         param.requires_grad = True
-        
+
             else:
                 if self.config["n_frozen_layers"] > 0:
                     self.language_model.embeddin_table.weight.requires_grad_(False)
@@ -202,6 +206,7 @@ class Trainer:
         self.current_ckpt_path = self.config['current_ckpt_path']
         self.last_ckpt_path = self.config['last_ckpt_path']
         self.lr_cosine_steps = self.config['lr_cosine_steps']
+        self.qlora = self.config['qlora']
 
         if self.config['lora_rank'] == 0 and self.config['n_frozen_layers'] > 0:
             suffix = f"_frozen_{self.config['n_frozen_layers']}"
@@ -286,7 +291,7 @@ class Trainer:
             
 
             else:  # DDP, fresh fine-tuning from a pretrained backbone
-                if self.global_rank == 0:
+                if self.global_rank == 0 or self.qlora:
                     print("Loading pretrained GPT checkpoint on rank 0...", flush=True)
             
                     checkpoint = torch.load(
@@ -574,9 +579,10 @@ class Trainer:
                                     'best_val_loss': self.best_val_loss,
                                     }
 
+                                lora_prefix = "" if not self.qlora else "q"
                                 torch.save(
                                     checkpoint,
-                                    f"lora_weights_{self.config['lora_rank']}.pt"
+                                    f"{lora_prefix}lora_weights_{self.config['lora_rank']}.pt"
                                 )
 
                         total_train_loss.zero_()
